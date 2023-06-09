@@ -16,7 +16,10 @@ class ChannelsLastConverter(OptimizerPass):
 
     def transform(self, model, node):
         # If this parameter has not been set, this model does not need to be converted
-        if 'InputsChannelLast' not in model.config.config['HLSConfig']['Model']:
+        if (
+            'InputsChannelLast' not in model.config.config['HLSConfig']['Model']
+            or model.config.config['HLSConfig']['Model']['InputsChannelLast']
+        ):
             node.channels_last_converted = True
             return False
         outshape = node.get_output_variable().shape
@@ -93,8 +96,10 @@ class ChannelsLastConverter(OptimizerPass):
                 transpose_node.channels_last_converted = True
 
                 model.insert_node(transpose_node)
+        # elif not model.config.config['HLSConfig']['Model']['InputsChannelLast']:
         else:
-            input_shape = node.get_output_variable().shape
+            input_shape = list(node.get_output_variable().shape)
+            print(input_shape)
             input_shape.append(input_shape.pop(0))
             node.get_output_variable().shape = input_shape
             dim_names = node.get_output_variable().dim_names

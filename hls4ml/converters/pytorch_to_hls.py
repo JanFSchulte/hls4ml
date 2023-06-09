@@ -181,7 +181,7 @@ def pytorch_to_hls(config):
         input_shapes = [list(reader.input_shape)]
     else:
         input_shapes = list(reader.input_shape)
-
+    print(input_shapes)
     model = reader.torch_model
 
     # dict of layer objects in non-traced form for access lateron
@@ -199,7 +199,7 @@ def pytorch_to_hls(config):
     # Map inputs of skipped and split (activation) layers
     # inputs_map = {}
 
-    input_layers = None
+    input_layers = []
     # output_layers = None
 
     # layer_config = None
@@ -284,13 +284,14 @@ def pytorch_to_hls(config):
 
         if node.op == 'placeholder':
             # 'placeholder' indicates an input layer. Multiple inputs are supported
-
+            print(n_inputs)
             input_layer = {}
             input_layer['name'] = node.name
             input_layer['class_name'] = 'InputLayer'
             input_layer['input_shape'] = input_shapes[n_inputs][1:]
             layer_list.insert(n_inputs, input_layer)
 
+            input_layers.append(node.name)
             output_shapes[input_layer['name']] = input_shapes[n_inputs]
             n_inputs += 1
 
@@ -375,12 +376,14 @@ def pytorch_to_hls(config):
             layer_counter += 1
 
             if 'View' in operation:
-                input_names = tuple([str(node.args[0])])
+                input_names = [str(node.args[0])]
             else:
-                input_names = tuple([str(i) for i in node.args])
-
+                input_names = [str(i) for i in node.args]
             # Process the layer
-            input_shapes = [list(output_shapes[str(i)]) for i in list(input_names)]
+            for input in input_names:
+                if input not in output_shapes:
+                    input_names.remove(input)
+            input_shapes = [list(output_shapes[str(i)]) for i in input_names]
 
             layer, output_shape = layer_handlers[operation](
                 operation, layer_name, input_names, input_shapes, node, None, reader, config

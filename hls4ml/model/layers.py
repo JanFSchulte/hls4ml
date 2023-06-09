@@ -1271,6 +1271,60 @@ class GarNetStack(GarNet):
         self._output_features = self.attributes['n_out_features'][-1]
 
 
+class ScatterAdd1D(Layer):
+    _expected_attributes = [
+        Attribute('dim'),
+        Attribute('in_x'),
+        Attribute('index_x'),
+        Attribute('src_x'),
+    ]
+
+    def initialize(self):
+        assert len(self.inputs) == 3
+
+        inp1 = self.get_input_variable(self.inputs[0])
+        self.add_output_variable(inp1.shape, inp1.dim_names)
+
+
+class ScatterAdd2D(Layer):
+    _expected_attributes = [
+        Attribute('dim'),
+        Attribute('in_x'),
+        Attribute('in_y'),
+        Attribute('index_x'),
+        Attribute('index_y'),
+        Attribute('src_x'),
+        Attribute('src_y'),
+    ]
+
+    def initialize(self):
+        assert len(self.inputs) == 3
+
+        inp1 = self.get_input_variable(self.inputs[0])
+        self.add_output_variable(inp1.shape, inp1.dim_names)
+
+
+class ScatterAdd3D(Layer):
+    _expected_attributes = [
+        Attribute('dim'),
+        Attribute('in_x'),
+        Attribute('in_y'),
+        Attribute('in_z'),
+        Attribute('index_x'),
+        Attribute('index_y'),
+        Attribute('index_z'),
+        Attribute('src_x'),
+        Attribute('src_y'),
+        Attribute('src_z'),
+    ]
+
+    def initialize(self):
+        assert len(self.inputs) == 3
+
+        inp1 = self.get_input_variable(self.inputs[0])
+        self.add_output_variable(inp1.shape, inp1.dim_names)
+
+
 layer_map = {
     'Input': Input,
     'InputLayer': Input,
@@ -1324,6 +1378,9 @@ layer_map = {
     'GarNetStack': GarNetStack,
     # TensorFlow-specific layers:
     'BiasAdd': BiasAdd,
+    'ScatterAdd1D': ScatterAdd1D,
+    'ScatterAdd2D': ScatterAdd2D,
+    'ScatterAdd3D': ScatterAdd3D,
 }
 
 
