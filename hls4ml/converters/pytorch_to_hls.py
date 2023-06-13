@@ -257,7 +257,6 @@ def pytorch_to_hls(config):
             input_layer['input_shape'] = list(input_shapes[n_inputs][1:])
             layer_list.insert(n_inputs, input_layer)
 
-            input_layers.append(node.name)
             output_shapes[input_layer['name']] = input_shapes[n_inputs]
             input_layers.append(input_layer['name'])
             n_inputs += 1
@@ -346,6 +345,9 @@ def pytorch_to_hls(config):
                 input_names = [str(i) for i in node.args]
 
             # Process the layer
+            for input in input_names:
+                if input not in output_shapes:
+                    input_names.remove(input)
             input_shapes = [list(output_shapes[str(i)]) for i in input_names]
 
             layer, output_shape = layer_handlers[operation](

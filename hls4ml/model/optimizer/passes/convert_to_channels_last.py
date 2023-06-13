@@ -17,8 +17,9 @@ class ChannelsLastConverter(OptimizerPass):
     def transform(self, model, node):
         # If this parameter has not been set, this model does not need to be converted
         if (
-            'InputsChannelLast' not in model.config.config['HLSConfig']['Model']
-            or model.config.config['HLSConfig']['Model']['InputsChannelLast']
+            'InputsChannelLast'
+            not in model.config.config['HLSConfig']['Model']
+            # or model.config.config['HLSConfig']['Model']['InputsChannelLast']
         ):
             node.channels_last_converted = True
             return False
