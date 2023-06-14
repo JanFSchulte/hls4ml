@@ -1283,7 +1283,8 @@ class ScatterAdd1D(Layer):
         assert len(self.inputs) == 3
 
         inp1 = self.get_input_variable(self.inputs[0])
-        self.add_output_variable(inp1.shape, inp1.dim_names)
+        dims = [f'N_OUT_1_{self.index}']
+        self.add_output_variable(inp1.shape, dims)
 
 
 class ScatterAdd2D(Layer):
@@ -1301,7 +1302,8 @@ class ScatterAdd2D(Layer):
         assert len(self.inputs) == 3
 
         inp1 = self.get_input_variable(self.inputs[0])
-        self.add_output_variable(inp1.shape, inp1.dim_names)
+        dims = [f'N_OUT_1_{self.index}', f'N_OUT_2_{self.index}']
+        self.add_output_variable(inp1.shape, dims)
 
 
 class ScatterAdd3D(Layer):
@@ -1322,7 +1324,8 @@ class ScatterAdd3D(Layer):
         assert len(self.inputs) == 3
 
         inp1 = self.get_input_variable(self.inputs[0])
-        self.add_output_variable(inp1.shape, inp1.dim_names)
+        dims = [f'N_OUT_1_{self.index}', f'N_OUT_2_{self.index}', f'N_OUT_3_{self.index}']
+        self.add_output_variable(inp1.shape, dims)
 
 
 layer_map = {

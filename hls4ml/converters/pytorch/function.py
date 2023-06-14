@@ -27,6 +27,12 @@ def parse_scatter_layer(operation, layer_name, input_names, input_shapes, node, 
         layer['index_x'] = input_shapes[1][2]
         layer['src_y'] = input_shapes[2][1]
         layer['src_x'] = input_shapes[2][2]
+    #        layer['in_y'] = input_shapes[0][1]
+    #        layer['in_x'] = input_shapes[0][2]
+    #        layer['index_y'] = input_shapes[1][1]
+    #        layer['index_x'] = input_shapes[1][2]
+    #        layer['src_y'] = input_shapes[2][1]
+    #        layer['src_x'] = input_shapes[2][2]
     elif len(input_shapes[0]) == 4:
         layer['class_name'] = "ScatterAdd3D"
         layer['op'] = "ScatterAdd3D"

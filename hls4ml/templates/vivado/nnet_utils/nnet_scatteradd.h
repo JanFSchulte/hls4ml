@@ -43,12 +43,50 @@ void scatter_add_3d(input1_T target[CONFIG_T::in_z * CONFIG_T::in_y * CONFIG_T::
                         src[i * CONFIG_T::index_x * CONFIG_T::index_y + j * CONFIG_T::index_x + k];
                 else if (CONFIG_T::dim == 1)
                     result[i * CONFIG_T::in_x * CONFIG_T::in_y +
-                           j * index[i * CONFIG_T::index_x * CONFIG_T::index_y + j * CONFIG_T::index_x + k] + k] +=
+                           index[i * CONFIG_T::index_x * CONFIG_T::index_y * CONFIG_T::index_x + k] + k] +=
                         src[i * CONFIG_T::index_x * CONFIG_T::index_y + j * CONFIG_T::index_x + k];
                 else if (CONFIG_T::dim == 2)
                     result[i * CONFIG_T::in_x * CONFIG_T::in_y + j * CONFIG_T::in_x +
                            index[i * CONFIG_T::index_x * CONFIG_T::index_y + j * CONFIG_T::in_x + k]] +=
                         src[i * CONFIG_T::index_x * CONFIG_T::index_y + j * CONFIG_T::index_x + k];
+            }
+        }
+    }
+}
+// If the input tensors have been transposed, need different version to deal with indices
+template <class input1_T, class res_T, class input2_T, class input3_T, typename CONFIG_T>
+void scatter_add_3d_t(input1_T target[CONFIG_T::in_z * CONFIG_T::in_y * CONFIG_T::in_x],
+                      res_T result[CONFIG_T::in_z * CONFIG_T::in_y * CONFIG_T::in_x],
+                      input2_T index[CONFIG_T::index_z * CONFIG_T::index_y * CONFIG_T::index_x],
+                      input3_T src[CONFIG_T::src_z * CONFIG_T::src_y * CONFIG_T::src_x]) {
+
+    // prepare tensor array with values from input tensor
+    for (int i = 0; i < CONFIG_T::in_z; ++i) {
+        for (int j = 0; j < CONFIG_T::in_y; ++j) {
+            for (int k = 0; k < CONFIG_T::in_x; ++k) {
+                result[i * CONFIG_T::in_x * CONFIG_T::in_y + j * CONFIG_T::in_x + k] =
+                    target[i * CONFIG_T::in_x * CONFIG_T::in_y + j * CONFIG_T::in_x + k];
+            }
+        }
+    }
+
+    // perform scatter_add operation (not yet optimized)
+    for (int i = 0; i < CONFIG_T::index_y; ++i) {
+        for (int j = 0; j < CONFIG_T::index_x; ++j) {
+            for (int k = 0; k < CONFIG_T::index_z; ++k) {
+                if (CONFIG_T::dim == 0)
+                    result[CONFIG_T::in_x * CONFIG_T::in_z * i + CONFIG_T::in_z * j +
+                           index[i * CONFIG_T::index_x * CONFIG_T::index_z + j * CONFIG_T::index_z + k]] +=
+                        src[i * CONFIG_T::index_x * CONFIG_T::index_z + j * CONFIG_T::index_z + k];
+                else if (CONFIG_T::dim == 1)
+                    result[index[i * CONFIG_T::index_x * CONFIG_T::index_z + j * CONFIG_T::index_z + k] * CONFIG_T::in_x *
+                               CONFIG_T::in_y +
+                           j * CONFIG_T::in_z + k] +=
+                        src[i * CONFIG_T::index_z * CONFIG_T::index_x + j * CONFIG_T::index_x + k];
+                else if (CONFIG_T::dim == 2)
+                    result[i * CONFIG_T::in_x * CONFIG_T::in_y +
+                           index[i * CONFIG_T::index_z * CONFIG_T::index_x + j * CONFIG_T::in_z + k] * CONFIG_T::in_z + k] +=
+                        src[i * CONFIG_T::index_z * CONFIG_T::index_x + j * CONFIG_T::index_z + k];
             }
         }
     }
@@ -76,12 +114,35 @@ void scatter_add_2d(input1_T target[CONFIG_T::in_y * CONFIG_T::in_x], res_T resu
     }
 
     // perform scatter_add operation (not yet optimized)
-    for (int i = 0; i < CONFIG_T::index_y; ++i) {
-        for (int j = 0; j < CONFIG_T::index_x; ++j) {
+    for (int i = 0; i < CONFIG_T::index_x; ++i) {
+        for (int j = 0; j < CONFIG_T::index_y; ++j) {
             if (CONFIG_T::dim == 0)
                 result[CONFIG_T::in_x * index[i * CONFIG_T::index_x + j] + j] += src[i * CONFIG_T::index_x + j];
             else if (CONFIG_T::dim == 1)
                 result[i * CONFIG_T::in_x + index[i * CONFIG_T::index_x + j]] += src[i * CONFIG_T::index_x + j];
+        }
+    }
+}
+// If the input tensors have been transposed, need different version to deal with indices
+template <class input1_T, class res_T, class input2_T, class input3_T, typename CONFIG_T>
+void scatter_add_2d_t(input1_T target[CONFIG_T::in_y * CONFIG_T::in_x], res_T result[CONFIG_T::in_y * CONFIG_T::in_x],
+                      input2_T index[CONFIG_T::index_y * CONFIG_T::index_x],
+                      input3_T src[CONFIG_T::src_y * CONFIG_T::src_x]) {
+
+    // prepare tensor array with values from input tensor
+    for (int i = 0; i < CONFIG_T::in_y; ++i) {
+        for (int j = 0; j < CONFIG_T::in_x; ++j) {
+            result[i * CONFIG_T::in_x + j] = target[i * CONFIG_T::in_x + j];
+        }
+    }
+
+    // perform scatter_add operation (not yet optimized)
+    for (int i = 0; i < CONFIG_T::index_x; ++i) {
+        for (int j = 0; j < CONFIG_T::index_y; ++j) {
+            if (CONFIG_T::dim == 0)
+                result[CONFIG_T::in_y * i + index[i * CONFIG_T::index_y + j]] += src[i * CONFIG_T::index_y + j];
+            else if (CONFIG_T::dim == 1)
+                result[index[i * CONFIG_T::index_y + j] * CONFIG_T::in_x + j] += src[i * CONFIG_T::index_y + j];
         }
     }
 }

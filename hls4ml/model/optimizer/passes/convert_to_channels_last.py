@@ -85,7 +85,6 @@ class ChannelsLastConverter(OptimizerPass):
             ):
                 input = node.name
                 outshape = node.get_output_variable().shape
-                print(outshape)
                 if len(outshape) == 2:
                     attributes = {'perm': [1, 0]}
                 else:
@@ -100,7 +99,6 @@ class ChannelsLastConverter(OptimizerPass):
         # elif not model.config.config['HLSConfig']['Model']['InputsChannelLast']:
         else:
             input_shape = list(node.get_output_variable().shape)
-            print(input_shape)
             input_shape.append(input_shape.pop(0))
             node.get_output_variable().shape = input_shape
             dim_names = [f'N_INPUT_{i}_{node.index}' for i in range(1, len(input_shape) + 1)]

@@ -512,8 +512,10 @@ class ModelGraph:
                     )
                 )
             next_node = before
-
-        if next_node is not None:
+        for next_node in next_nodes:
+            # if next_node is not None:
+            if prev_node.name in next_node.inputs:
+                input_idx = next_node.inputs.index(prev_node.name)
             next_node.inputs[input_idx] = node.outputs[0]
 
         new_graph = OrderedDict()

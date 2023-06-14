@@ -41,9 +41,11 @@ scatteraddd1d_function_template = (
 scatteraddd2d_function_template = (
     'nnet::scatter_add_2d<{input1_t}, {output_t}, {input2_t}, {input3_t}, {config}>({input1}, {output}, {input2}, {input3});'
 )
+scatteraddd2dt_function_template = 'nnet::scatter_add_2d_t<{input1_t}, {output_t}, {input2_t}, {input3_t}, {config}>({input1}, {output}, {input2}, {input3});'  # noqa: E501
 scatteraddd3d_function_template = (
     'nnet::scatter_add_3d<{input1_t}, {output_t}, {input2_t}, {input3_t}, {config}>({input1}, {output}, {input2}, {input3});'
 )
+scatteraddd3dt_function_template = 'nnet::scatter_add_3d_t<{input1_t}, {output_t}, {input2_t}, {input3_t}, {config}>({input1}, {output}, {input2}, {input3});'  # noqa: E501
 
 
 class ScatterAddConfigTemplate(LayerConfigTemplate):
@@ -69,7 +71,9 @@ class ScatterAddFunctionTemplate(FunctionCallTemplate):
         self.templates = {
             'ScatterAdd1D': scatteraddd1d_function_template,
             'ScatterAdd2D': scatteraddd2d_function_template,
+            'ScatterAdd2DTransposed': scatteraddd2dt_function_template,
             'ScatterAdd3D': scatteraddd3d_function_template,
+            'ScatterAdd3DTransposed': scatteraddd3dt_function_template,
         }
 
     def format(self, node):
@@ -80,4 +84,7 @@ class ScatterAddFunctionTemplate(FunctionCallTemplate):
         params['input1'] = node.get_input_variable(node.inputs[0]).name
         params['input2'] = node.get_input_variable(node.inputs[1]).name
         params['input3'] = node.get_input_variable(node.inputs[2]).name
-        return self.templates[node.class_name].format(**params)
+        if hasattr(node, 'channels_last_converted'):
+            return self.templates[node.class_name + "Transposed"].format(**params)
+        else:
+            return self.templates[node.class_name].format(**params)
