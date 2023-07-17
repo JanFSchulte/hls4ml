@@ -28,6 +28,11 @@ class PyTorchModelReader:
             'beta': 'bias',
             'moving_mean': 'running_mean',
             'moving_variance': 'running_var',
+            #Recurrent layers
+            'weight_ih_l': 'weight_ih_l',
+            'weight_hh_l': 'weight_hh_l',
+            'bias_ih_l': 'bias_ih_l',
+            'bias_hh_l': 'bias_hh_l',
         }
 
         # Workaround for naming schme in nn.Sequential,
@@ -167,7 +172,7 @@ def pytorch_to_hls(config):
 
     # All supported layers
     supported_layers = get_supported_pytorch_layers() + skip_layers
-
+    print (supported_layers)
     input_layers = []
 
     # Output shape tracking
@@ -179,6 +184,8 @@ def pytorch_to_hls(config):
     layer_counter = 0
 
     n_inputs = 0
+
+    print (traced_model.graph)
 
     for node in traced_model.graph.nodes:
         # If part of a nn.Sequntial, the node name will start with an "_" which messes up the parsing
@@ -275,6 +282,8 @@ def pytorch_to_hls(config):
                 operation = layer_name_map[operation]
 
             # only a limited number of functions are supported
+            if operation == "getitem": 
+                continue
             if operation not in supported_layers:
                 raise Exception(f'Unsupported function {operation}')
             if operation == 'PReLU' or operation == 'batch_norm' or operation == 'conv1d' or operation == 'conv2d':
