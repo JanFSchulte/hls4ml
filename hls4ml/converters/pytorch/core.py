@@ -1,7 +1,7 @@
 from hls4ml.converters.pytorch_to_hls import get_weights_data, pytorch_handler
 
-
-@pytorch_handler('Linear')
+linear_layers = ['Linear', 'QuantLinear']
+@pytorch_handler(*linear_layers)
 def parse_linear_layer(operation, layer_name, input_names, input_shapes, node, class_object, data_reader, config):
     assert 'Linear' in operation
 

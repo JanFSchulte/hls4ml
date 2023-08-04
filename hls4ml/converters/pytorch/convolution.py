@@ -1,8 +1,8 @@
 from hls4ml.converters.pytorch_to_hls import get_weights_data, pytorch_handler
 from hls4ml.converters.utils import compute_padding_1d_pytorch, compute_padding_2d_pytorch, parse_data_format
 
-
-@pytorch_handler('Conv1d')
+conv1d_layers = ['Conv1d', 'QuantConv1d']
+@pytorch_handler(*conv1d_layers)
 def parse_conv1d_layer(operation, layer_name, input_names, input_shapes, node, class_object, data_reader, config):
     assert 'Conv1d' in operation
 
@@ -46,8 +46,8 @@ def parse_conv1d_layer(operation, layer_name, input_names, input_shapes, node, c
 
     return layer, output_shape
 
-
-@pytorch_handler('Conv2d')
+conv2d_layers = ['Conv2d', 'QuantConv2d']
+@pytorch_handler(*conv2d_layers)
 def parse_conv2d_layer(operation, layer_name, input_names, input_shapes, node, class_object, data_reader, config):
     assert 'Conv2d' in operation
 

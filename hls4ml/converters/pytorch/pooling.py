@@ -88,15 +88,22 @@ def parse_pooling_layer(operation, layer_name, input_names, input_shapes, node, 
             if type(node.kwargs['stride']) is tuple:
                 layer['stride_height'] = node.kwargs['stride'][0]
                 layer['stride_width'] = node.kwargs['stride'][1]
+            elif node.kwargs['stride'] == None:
+                if type(node.args[1]) is tuple:
+                    layer['stride_height'] = node.args[1][0]
+                    layer['stride_width'] = node.args[1][1]
+                else:
+                    layer['stride_height'] = node.args[1]
+                    layer['stride_width'] = node.args[1]                
             else:
                 layer['stride_height'] = node.kwargs['stride']
                 layer['stride_width'] = node.kwargs['stride']
-            if type(node.kwargs['kernel_size']) is tuple:
-                layer['pool_height'] = node.kwargs['kernel_size'][0]
-                layer['pool_width'] = node.kwargs['kernel_size'][1]
+            if type(node.args[1]) is tuple:
+                layer['pool_height'] = node.args[1][0]
+                layer['pool_width'] = node.args[1][1]
             else:
-                layer['pool_height'] = node.kwargs['kernel_size']
-                layer['pool_width'] = node.kwargs['kernel_size']
+                layer['pool_height'] = node.args[1]
+                layer['pool_width'] = node.args[1]
 
             if type(node.kwargs['padding']) is tuple:
                 padding = node.kwargs['padding']

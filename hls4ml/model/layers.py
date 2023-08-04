@@ -1289,6 +1289,28 @@ class LayerGroup(Layer):
 
         self.add_output_variable(shape, dims)
 
+class GetItem(Layer):
+    _expected_attributes = [
+        Attribute('item_index'),
+    ]
+
+    def initialize(self):
+        shape = self.get_input_variable().shape[1:]
+        dims = [f'N_INPUT_{self.index}_{i+1}' for i in range(len(shape))]
+
+        self.add_output_variable(shape, dims)
+
+class Gather(Layer):
+    def initialize(self):
+        tensor_shape = self.get_input_variable(self.inputs[0]).shape
+        index_shape = self.get_input_variable(self.inputs[1]).shape
+        output_shape = tensor_shape[:]
+        output_shape[0] = index_shape[-1]
+        dims = [f'N_INPUT_{self.index}_{i+1}' for i in range(len(output_shape)-1)]
+        dims.append(f'N_INDEX_{self.index}')
+
+        self.add_output_variable(output_shape, dims)
+
 
 layer_map = {
     'Input': Input,
@@ -1344,6 +1366,8 @@ layer_map = {
     'LayerGroup': LayerGroup,
     # TensorFlow-specific layers:
     'BiasAdd': BiasAdd,
+    'GetItem': GetItem,
+    'Gather': Gather
 }
 
 
