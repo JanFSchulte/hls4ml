@@ -564,7 +564,9 @@ class ModelGraph:
                 for i, nxt_inp in enumerate(next_node.inputs):
                     if outputs[0] == nxt_inp:
                         next_node.inputs[i] = inputs[0]
-
+        if node.outputs[0] in self.outputs:
+            prev_node = node.get_input_node(node.inputs[0])
+            self.outputs[self.outputs.index(node.outputs[0])] = prev_node.outputs[0]
         del self.output_vars[node.outputs[0]]
         del self.graph[node.name]
 
@@ -597,6 +599,7 @@ class ModelGraph:
 
         self.graph = OrderedDict((new_node.name, new_node) if k == old_node.name else (k, v) for k, v in self.graph.items())
 
+        self.output_vars[new_node.name] = new_node.get_output_variable()
         old_name = old_node.name
         if old_name in self.outputs:
             new_name = new_node.name
