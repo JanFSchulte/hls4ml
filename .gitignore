@@ -15,3 +15,7 @@ hls4mlprj_*
 *~
 *.ipynb_checkpoints/
 *.bak
+
+# HEPT demo/training scratch (see hls4ml/convertSimpleHEPT.py, train_simple_hept*.py)
+hls4ml/hept_test/
+hls4ml/data/
