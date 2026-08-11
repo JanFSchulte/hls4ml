@@ -86,6 +86,9 @@ register_flow(
         'propagate_snn_readout_window_size',
         'eliminate_linear_activation',
         'merge_linear_activation',
+        # needs the final softmax input precision from bit_exact, and must run before the
+        # backend's transform_types converts weight variables
+        'materialize_softmax_tables',
         # many of the above optimzers need to be done before this
         'infer_precision_types',
     ],

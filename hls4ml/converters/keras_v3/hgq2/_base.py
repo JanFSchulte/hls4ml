@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 from math import prod
 from typing import TYPE_CHECKING, Any
+from warnings import warn
 
 import numpy as np
 
@@ -38,6 +39,19 @@ def extract_fixed_quantizer_config(q, tensor: 'KerasTensor', is_input: bool) -> 
         k = np.ravel(k).astype(np.int16)
         B = np.ravel(B).astype(np.int16)
         I = np.ravel(I).astype(np.int16)  # noqa: E741
+
+    # HGQ's heterogeneous quantizers can train a channel down to a negative total width.
+    # Clamp to 0, not 1: B == 0 is the "this channel is constant zero" encoding that
+    # generate_mask_fn understands, while B == 1 would resurrect the channel as a live
+    # 1-bit one. I is left alone -- it is legitimately negative (e.g. ap_ufixed<3,-2>) and
+    # is already zeroed for exactly the dead channels above.
+    if np.any(B < 0):
+        warn(
+            f'Quantizer {q.name} has {int(np.sum(B < 0))} channel(s) with total bitwidth < 0; '
+            'treating them as constant zero.',
+            stacklevel=2,
+        )
+    B = np.maximum(B, 0)
 
     overflow_mode: str = internal_q.overflow_mode
     round_mode: str = internal_q.round_mode
