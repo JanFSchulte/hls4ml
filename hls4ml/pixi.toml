@@ -1,0 +1,123 @@
+[workspace]
+name = "hls4ml-hept"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+description = "Pixi environment for the HEPT/hls4ml training + conversion pipeline (conda alternative to the hls4ml-hept conda env)."
+
+# Minimal, HEPT-focused environment: only what train_simple_hept.py,
+# train_simple_hept_qat.py and convertSimpleHEPT.py actually import (traced through
+# HEPT/src/models/attention/__init__.py, which eagerly imports every attention
+# variant, not just "hept"). Excludes the rest of the live hls4ml-hept conda env's
+# dev/doc/test toolchain (TensorFlow, QKeras, mkdocs, tox, pytest, twine, optuna,
+# kaggle, ...), which is unrelated to this work.
+#
+# Versions below are pinned to exactly what's installed in the hls4ml-hept conda env
+# as of 2026-09-21 (`pip list --format=freeze` in that env). Use `pixi install` to
+# create the environment, then `pixi run <task>` or `pixi shell` to use it.
+
+[dependencies]
+python = "3.11.*"
+# Conda-installed (not pypi-dependencies) so they're present in the base env before
+# pixi resolves/builds pypi packages. setuptools + pip are both needed for the
+# pytorch-fast-transformers post-install step below (see [tasks]).
+setuptools = "*"
+pip = "*"
+
+# PyTorch's CUDA wheels are a proper index (extra-index-urls works); PyG's compiled
+# extensions (torch_scatter/torch_sparse/pyg_lib) are published as flat per-build
+# link pages, not a real package index, so they need `find-links`, not `index` --
+# using `index` on those (even per-dependency) fails to resolve even though the
+# wheel is genuinely there (verified: data.pyg.org/whl/torch-2.8.0+cu128.html lists
+# torch_scatter-2.1.2+pt28cu128-cp311-...-linux_x86_64.whl, but `pixi add --pypi
+# torch_scatter==2.1.2+pt28cu128 --index https://data.pyg.org/...` still errors
+# "not found in the package registry"; switching to find-links fixes it).
+[pypi-options]
+extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
+find-links = [
+  { url = "https://data.pyg.org/whl/torch-2.8.0+cu128.html" },
+  { url = "https://data.pyg.org/whl/torch-2.8.0+cpu.html" },
+]
+# The pytorch cu128 index also carries a (stale/mismatched) torchmetrics build;
+# without this, uv stops at the first index that has *any* match for a package
+# name and never considers PyPI's actual torchmetrics==1.9.0.
+index-strategy = "unsafe-best-match"
+
+[pypi-dependencies]
+# --- core ML / geometric deep learning stack ---
+torch = "==2.8.0"
+torch-geometric = "==2.7.0"
+# torch_scatter is the cu128 (GPU) build; torch_sparse and pyg_lib are the cpu
+# build -- this mirrors what's actually installed in the conda env (not all
+# extensions had a cu128 wheel available at install time there).
+torch-scatter = "==2.1.2+pt28cu128"
+torch-sparse = "==0.6.18+pt28cpu"
+pyg-lib = "==0.6.0+pt28cpu"
+torch-cluster = "==1.6.3"
+torchmetrics = "==1.9.0"
+# tracking_trainer.py imports torch.utils.tensorboard.SummaryWriter unconditionally
+# at module level (even though log_tensorboard defaults to false in the configs).
+tensorboard = "==2.21.0"
+
+# --- numerics ---
+numpy = "==2.4.6"
+scipy = "==1.17.1"
+pandas = "==3.0.3"
+numba = "==0.65.1"
+llvmlite = "==0.47.0"
+
+# --- HEPT model code ---
+einops = "==0.8.2"
+# pytorch-fast-transformers is NOT listed here: models/attention/__init__.py imports
+# every attention variant eagerly (not just "hept"), so performer.py/flt.py need it
+# importable -- but its setup.py imports torch directly at build time (no PEP517
+# build-system declared) with no prebuilt wheel on PyPI, which uv's single-pass
+# resolver can't satisfy even with no-build-isolation (torch isn't physically
+# installed yet during metadata resolution). Install it as a separate step, after
+# torch is already in the environment -- see the `postinstall` task below.
+# `pixi run postinstall` right after `pixi install` (or first `pixi run` of
+# anything) handles this.
+
+# --- tracking-600 dataset I/O (HEPT/src/datasets/tracking.py, get_data.py) ---
+h5py = "==3.16.0"
+uproot = "==5.7.4"
+awkward = "==2.9.0"
+awkward_cpp = "==52"
+cramjam = "==2.11.0"
+xxhash = "==3.7.0"
+
+# --- misc HEPT deps (fvcore/iopath: flop counting in get_model.py; joblib: dataset
+# caching; PyYAML: configs/*.yaml) ---
+fvcore = "==0.1.5.post20221221"
+iopath = "==0.1.10"
+joblib = "==1.5.3"
+PyYAML = "==6.0.3"
+
+# --- QAT ---
+pquant-ml = "==0.0.6"
+
+# --- hls4ml itself, editable, from this repo (pulls its own light core deps:
+# h5py, numpy, pydigitalwavetools, pyyaml, quantizers -- already pinned above where
+# they overlap) ---
+pydigitalwavetools = "==1.1"
+quantizers = "==1.2.2"
+# pyproject.toml for the hls4ml package lives one directory up from this file's
+# repo (hls4ml/hls4ml is the package source dir nested inside the outer repo root).
+hls4ml = { path = "..", editable = true }
+
+[activation.env]
+# hls4ml's core deps pull in `quantizers`, which pulls in Keras 3; Keras defaults to
+# a TensorFlow backend if unset, which we deliberately don't install (minimal-scope
+# decision -- unrelated to HEPT). Keras 3 natively supports a torch backend, and
+# torch is already here, so this avoids needing TensorFlow at all.
+KERAS_BACKEND = "torch"
+
+[tasks]
+# One-time (idempotent) step to finish installing pytorch-fast-transformers, which
+# can't go through the normal pypi-dependencies resolve -- see the comment above.
+# `--no-deps` because its own (very old) pinned deps aren't relevant here; torch is
+# already satisfied by this environment.
+postinstall = "pip install --no-build-isolation --no-deps pytorch-fast-transformers==0.4.0"
+train = { cmd = "python train_simple_hept.py", depends-on = ["postinstall"] }
+train-qat = { cmd = "python train_simple_hept_qat.py", depends-on = ["postinstall"] }
+convert = { cmd = "python convertSimpleHEPT.py", depends-on = ["postinstall"] }
