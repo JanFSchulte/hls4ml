@@ -51,6 +51,13 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Override the yaml's seed.")
     parser.add_argument("--device", type=str, default=None, help="Override the yaml's device.")
     parser.add_argument("--note", type=str, default=None, help="Override the yaml's log-dir note.")
+    parser.add_argument(
+        "--block-size", type=int, default=None, help="Override model_kwargs.block_size (local-attention window)."
+    )
+    parser.add_argument("--num-heads", type=int, default=None, help="Override model_kwargs.num_heads.")
+    parser.add_argument("--num-regions", type=int, default=None, help="Override model_kwargs.num_regions.")
+    parser.add_argument("--h-dim", type=int, default=None, help="Override model_kwargs.h_dim.")
+    parser.add_argument("--n-layers", type=int, default=None, help="Override model_kwargs.n_layers.")
     args = parser.parse_args()
 
     config_path = REPO_ROOT / "HEPT" / "src" / "configs" / "tracking" / f"tracking_trans_{args.model}.yaml"
@@ -64,6 +71,16 @@ def main():
         config["device"] = args.device
     if args.note is not None:
         config["note"] = args.note
+    if args.block_size is not None:
+        config["model_kwargs"]["block_size"] = args.block_size
+    if args.num_heads is not None:
+        config["model_kwargs"]["num_heads"] = args.num_heads
+    if args.num_regions is not None:
+        config["model_kwargs"]["num_regions"] = args.num_regions
+    if args.h_dim is not None:
+        config["model_kwargs"]["h_dim"] = args.h_dim
+    if args.n_layers is not None:
+        config["model_kwargs"]["n_layers"] = args.n_layers
 
     log_dir = run_one_seed(config)
 
