@@ -5,10 +5,15 @@ from pathlib import Path
 from shutil import copyfile, copytree, rmtree
 
 from hls4ml.backends import get_backend
+from hls4ml.writer.catapult_writer import CatapultWriter
 from hls4ml.writer.vivado_writer import VivadoWriter
 
 
 class SymbolicExpressionWriter(VivadoWriter):
+    def __init__(self):
+        super().__init__()
+        self.catapult_writer = CatapultWriter()
+
     def write_nnet_utils(self, model):
         """Copy the nnet_utils, AP types headers and any custom source to the project output directory
 
@@ -117,6 +122,10 @@ class SymbolicExpressionWriter(VivadoWriter):
         build_lib_dst.chmod(build_lib_dst.stat().st_mode | stat.S_IEXEC)
 
     def write_hls(self, model):
+        if model.config.get_config_value('Compiler') == 'catapult':
+            self.catapult_writer.write_hls(model)
+            return
+
         self.write_project_dir(model)
         self.write_project_cpp(model)
         self.write_project_header(model)

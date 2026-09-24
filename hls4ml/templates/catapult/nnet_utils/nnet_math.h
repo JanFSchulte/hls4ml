@@ -1,176 +1,155 @@
 #ifndef NNET_MATH_H_
 #define NNET_MATH_H_
 
-#include "hls_math.h"
+#include "ac_complex.h"
+#include "ac_fixed.h"
+#include <ac_math/ac_arccos_cordic.h>
+#include <ac_math/ac_arcsin_cordic.h>
+#include <ac_math/ac_atan2_cordic.h>
+#include <ac_math/ac_hcordic.h>
+#include <ac_math/ac_reciprocal_pwl.h>
+#include <ac_math/ac_sincos_cordic.h>
+#include <ac_math/ac_sincos_lut.h>
+#include <ac_math/ac_sqrt.h>
+#include <ac_math/ac_tanh_pwl.h>
 
 namespace nnet {
 
-// This header defines the functions that return type different from the input
-// For example, hls::sin(x) returns ac_fixed<W-I+2,2,true>
-// By ensuring we return the same type we can avoid casting issues in expressions
+// Math functions used by the SymbolicExpression layer, implemented with AC Math.
+// All functions take and return the same type T (an ac_fixed), so they can be used in expressions without casting
+// and as the function of a nnet::lookup_table. Internal precision is derived from the fractional bits of T.
+// Functions with a restricted domain (log, sqrt, pow) expect the input to lie in that domain.
 
-template <typename T> T sin(T x) { return (T)hls::sin(x); };
-
-template <typename T> T cos(T x) { return (T)hls::cos(x); };
-
-template <typename T> T asin(T x) { return (T)hls::asin(x); };
-
-template <typename T> T acos(T x) { return (T)hls::acos(x); };
-
-template <typename T> T atan(T x) { return (T)hls::atan(x); };
-
-template <typename T> T atan2(T x, T y) { return (T)hls::atan2(x, y); };
-
-template <class T, int W, int I> void init_sincos_table(T table[1 << (W - I - 3)][2]) {
-    unsigned int NTE = 1 << (W - I - 3); // No of table entries
-    double step = M_PI / (4 * NTE);      // Interval between angles
-    double y = 0;
-    // double scaled_angle = 0;
-
-    for (unsigned int i = 0; i < NTE; i++) {
-        table[i][0] = std::cos(y);
-        table[i][1] = std::sin(y);
-        y += step;
-        // scaled_angle = y/(2*M_PI);
-        // printf("cos(%f) = %23.22f, sin(%f) = %23.22f index = %d, scaled angle = %13.12f \n", y, cos(y), y, sin(y), i,
-        // scaled_angle);
-    }
+template <class T> T sin(T x) {
+    ac_fixed<T::width + 4, T::i_width, true> angle_over_pi = x * ac_fixed<20, 0, false>(0.318309886183790671);
+    ac_fixed<T::width - T::i_width + 2, 2, true> res;
+    ac_math::ac_sin_cordic(angle_over_pi, res);
+    return res;
 }
 
-template <class T> void sincos_lut(const T &input, T output[2]) {
-
-    #pragma HLS INLINE
-
-    // This implementation is based on ac_sincos_lut.h from AC math library
-
-    static bool flag = true;
-    if (flag && T::width - T::iwidth > 12) {
-#if !defined(__SYNTHESIS__) && defined(SINCOS_LUT_DEBUG)
-        std::cout << "FILE : " << __FILE__ << ", LINE : " << __LINE__ << std::endl;
-        std::cout << "Warning: The output of sincos_lut will not be accurate" << std::endl;
-#endif
-        flag = false;
-    }
-    // Datatype for lookup table entries
-    typedef ac_fixed<T::width, T::iwidth, false, AC_RND> luttype;
-    // Datatype for posinput which is used to handle negative inputs
-    typedef ac_fixed<T::width - T::iwidth, 0, false> posinputtype;
-
-    typedef ac_int<9, false> lutindextype; // 9 bits required for indexing into 512 entry table
-    typedef ac_int<3, false> octanttype;   // 3 bits required for octant value range of 0 thru 7
-    T outputtemp[2];
-    lutindextype luTdex = 0;
-    posinputtype posinput = input;
-
-    // Initialize the lookup table
-#ifdef __SYNTHESIS__
-    bool initialized = false;
-    luttype sincos[512][2];
-#else
-    static bool initialized = false;
-    static luttype sincos[512][2];
-#endif
-    if (!initialized) {
-        init_sincos_table<luttype, 12, 0>(sincos);
-        initialized = true;
-    }
-
-    // Leaving this commented out makes the table to to BRAM
-    //#pragma HLS ARRAY_PARTITION variable=sincos complete dim=0
-
-    typedef ac_int<AP_MAX(T::width - T::iwidth - 3, 1), false> lutindextype1;
-    // Extracting (MSB-3:LSB) bits of scaled input to determine the lookup table index
-    lutindextype1 luTdex1 = posinput.range(AP_MAX(T::width - T::iwidth - 3, 1), 0); // Extracting the lookup table index
-
-    if (T::width - T::iwidth >= 4 && T::width - T::iwidth <= 12) {
-        luTdex(8, 12 - (T::width - T::iwidth)) = luTdex1; // stride
-    }
-    // Approximation for the scaled inputs whose number of bits are greater than 12
-    else if (T::width - T::iwidth > 12) {
-        // Lookup table index for the scaled inputs whose number of bits are greater than 12
-        luTdex = luTdex1 / (1 << (AP_MAX(T::width - T::iwidth - 12, 0)));
-        if ((luTdex1 % (1 << (AP_MAX(T::width - T::iwidth - 12, 0)))) > (1 << (AP_MAX(T::width - T::iwidth - 13, 0)))) {
-            luTdex = luTdex + 1;
-        }
-        typedef ac_fixed<AP_MAX((AP_MAX(T::width - T::iwidth - 3, 1) + T::width - T::iwidth - 12), 1),
-                         AP_MAX(T::width - T::iwidth - 3, 1), false>
-            datatype;
-        datatype x = (datatype)luTdex1;
-        x = x >> AP_MAX(T::width - T::iwidth - 12, 0);
-        if (x > 511.5) {
-            luTdex = 511;
-        }
-        if (luTdex1 <= 1 << (AP_MAX(T::width - T::iwidth - 13, 0)) && luTdex1 != 0) {
-            luTdex = 1;
-        }
-    }
-
-    if (T::width - T::iwidth >= 3) {
-        // Getting the octant 0-7 by extracting the first 3 bits from MSB side of scaled input where
-        //   octant 0 corresponds to [0-PI/4),
-        //   octant 1 corresponds to [PI/4-2PI/4),
-        //   octant 2 corresponds to [2PI/4-3PI/4) and so on
-        // octanttype octant = posinput.template slc<3>(T::width-T::iwidth-3);
-        octanttype octant = posinput(T::width - T::iwidth - 1, T::width - T::iwidth - 3);
-        luTdex = (octant[0] == 1) ? (lutindextype)(512 - luTdex) : (lutindextype)(luTdex);
-        // imaginary part is sine
-        outputtemp[1] = ((octant == 0) | (octant == 3))   ? (T)sincos[luTdex][1]
-                        : ((octant == 2) | (octant == 1)) ? (T)sincos[luTdex][0]
-                        : ((octant == 7) | (octant == 4)) ? (T)-sincos[luTdex][1]
-                                                          : (T)-sincos[luTdex][0];
-        // real part is cosine
-        outputtemp[0] = ((octant == 6) | (octant == 1))   ? (T)sincos[luTdex][1]
-                        : ((octant == 3) | (octant == 4)) ? (T)-sincos[luTdex][0]
-                        : ((octant == 2) | (octant == 5)) ? (T)-sincos[luTdex][1]
-                                                          : (T)sincos[luTdex][0];
-        // Below two are the cases when the output corresponds to + or - (0 or 1) for which there is no entry in the lookup
-        // table
-        output[1] = ((posinput == 0.125) | (posinput == 0.375))   ? T(0.7071067811865475244008)
-                    : ((posinput == 0.625) | (posinput == 0.875)) ? T(-0.7071067811865475244008)
-                                                                  : outputtemp[1];
-        output[0] = ((posinput == 0.125) | (posinput == 0.875))   ? T(0.7071067811865475244008)
-                    : ((posinput == 0.375) | (posinput == 0.625)) ? T(-0.7071067811865475244008)
-                                                                  : outputtemp[0];
-    }
-
-    if (T::width - T::iwidth <= 2) {
-        output[1] = (posinput == 0)      ? (T)0
-                    : (posinput == 0.25) ? (T)1
-                    : (posinput == 0.5)  ? (T)0
-                    : (posinput == 0.75) ? (T)-1
-                                         : outputtemp[1];
-        output[0] = (posinput == 0)      ? (T)1
-                    : (posinput == 0.25) ? (T)0
-                    : (posinput == 0.5)  ? (T)-1
-                    : (posinput == 0.75) ? (T)0
-                                         : outputtemp[0];
-    }
-
-#if !defined(__SYNTHESIS__) && defined(SINCOS_LUT_DEBUG)
-    std::cout << "FILE : " << __FILE__ << ", LINE : " << __LINE__ << std::endl;
-    std::cout << "============AP_FIXED SINCOS======================" << std::endl;
-    std::cout << "positive input is   = " << posinput << std::endl;
-    std::cout << "lut index is   = " << luTdex << std::endl;
-    std::cout << "sin value is    = " << output[1] << std::endl;
-    std::cout << "cos value is    = " << output[0] << std::endl;
-    std::cout << "=================================================" << std::endl;
-#endif
+template <class T> T cos(T x) {
+    ac_fixed<T::width + 4, T::i_width, true> angle_over_pi = x * ac_fixed<20, 0, false>(0.318309886183790671);
+    ac_fixed<T::width - T::i_width + 2, 2, true> res;
+    ac_math::ac_cos_cordic(angle_over_pi, res);
+    return res;
 }
+
+template <class T> T tan(T x) {
+    ac_fixed<T::width - T::i_width + 2, 2, true> s = sin(x), c = cos(x);
+    return s / c;
+}
+
+// ac_arcsin_cordic and ac_arccos_cordic return the angle scaled by 1/pi
+
+template <class T> T asin(T x) {
+    ac_fixed<T::width, T::i_width, true> t = x;
+    ac_fixed<T::width - T::i_width + 3, 1, true> res_over_pi;
+    ac_math::ac_arcsin_cordic(t, res_over_pi);
+    return res_over_pi * ac_fixed<20, 2, false>(3.14159265358979323846);
+}
+
+template <class T> T acos(T x) {
+    ac_fixed<T::width, T::i_width, true> t = x;
+    ac_fixed<T::width - T::i_width + 2, 1, false> res_over_pi;
+    ac_math::ac_arccos_cordic(t, res_over_pi);
+    return res_over_pi * ac_fixed<20, 2, false>(3.14159265358979323846);
+}
+
+template <class T> T atan2(T y, T x) {
+    ac_fixed<T::width, T::i_width, true> y_s = y, x_s = x;
+    ac_fixed<T::width - T::i_width + 3, 3, true> res;
+    ac_math::ac_atan2_cordic(y_s, x_s, res);
+    return res;
+}
+
+template <class T> T atan(T x) { return atan2(x, T(1)); }
+
+template <class T> T exp(T x) {
+    ac_fixed<T::width, T::i_width, false> res;
+    ac_math::ac_exp_cordic(x, res);
+    return res;
+}
+
+template <class T> T log(T x) {
+    ac_fixed<T::width, T::i_width, false> x_u = x;
+    T res;
+    ac_math::ac_log_cordic(x_u, res);
+    return res;
+}
+
+template <class T> T log2(T x) {
+    ac_fixed<T::width, T::i_width, false> x_u = x;
+    T res;
+    ac_math::ac_log2_cordic(x_u, res);
+    return res;
+}
+
+template <class T> T log10(T x) { return log2(x) * ac_fixed<20, -1, false>(0.301029995663981195); }
+
+template <class T> T sqrt(T x) {
+    ac_fixed<T::width, T::i_width, false> x_u = x;
+    ac_fixed<T::width, T::i_width, false> res;
+    ac_math::ac_sqrt(x_u, res);
+    return res;
+}
+
+template <class T> T pow(T x, T y) {
+    ac_fixed<T::width, T::i_width, false> x_u = x;
+    ac_fixed<T::width, T::i_width, false> res;
+    ac_math::ac_pow_cordic(x_u, y, res);
+    return res;
+}
+
+template <class T> T recip(T x) {
+    T res;
+    ac_math::ac_reciprocal_pwl(x, res);
+    return res;
+}
+
+template <class T> T sinh(T x) {
+    ac_fixed<T::width, T::i_width, false> ep, em;
+    ac_math::ac_exp_cordic(x, ep);
+    ac_math::ac_exp_cordic(-x, em);
+    return (ep - em) * ac_fixed<1, 0, false>(0.5);
+}
+
+template <class T> T cosh(T x) {
+    ac_fixed<T::width, T::i_width, false> ep, em;
+    ac_math::ac_exp_cordic(x, ep);
+    ac_math::ac_exp_cordic(-x, em);
+    return (ep + em) * ac_fixed<1, 0, false>(0.5);
+}
+
+template <class T> T tanh(T x) {
+    T res;
+    ac_math::ac_tanh_pwl(x, res);
+    return res;
+}
+
+template <class T> T abs(T x) { return x < 0 ? T(-x) : x; }
+
+template <class T> T floor(T x) {
+    ac_fixed<T::i_width, T::i_width, T::sign> res = x;
+    return res;
+}
+
+template <class T> T ceil(T x) { return -floor<T>(-x); }
+
+// LUT-based sin/cos (see ac_sincos_lut.h), accurate up to 12 fractional bits of the input.
+// The input is scaled to revolutions and wrapped to [0, 1).
 
 template <class T> T sin_lut(const T input) {
-    #pragma HLS INLINE
-    T sincos_res[2];
-    T scaled_input = input * ac_fixed<16, 0, false>(0.15915494309); // 1/(2*pi)
-    sincos_lut(scaled_input, sincos_res);
-    return sincos_res[1];
+    ac_fixed<12, 0, false, AC_RND, AC_WRAP> scaled_input = input * ac_fixed<16, 0, false>(0.15915494309); // 1/(2*pi)
+    ac_complex<ac_fixed<T::width - T::i_width + 2, 2, true>> res;
+    ac_math::ac_sincos_lut(scaled_input, res);
+    return res.i();
 }
 
 template <class T> T cos_lut(const T input) {
-    #pragma HLS INLINE
-    T sincos_res[2];
-    T scaled_input = input * ac_fixed<16, 0, false>(0.15915494309); // 1/(2*pi)
-    sincos_lut(scaled_input, sincos_res);
-    return sincos_res[0];
+    ac_fixed<12, 0, false, AC_RND, AC_WRAP> scaled_input = input * ac_fixed<16, 0, false>(0.15915494309); // 1/(2*pi)
+    ac_complex<ac_fixed<T::width - T::i_width + 2, 2, true>> res;
+    ac_math::ac_sincos_lut(scaled_input, res);
+    return res.r();
 }
 
 } // namespace nnet

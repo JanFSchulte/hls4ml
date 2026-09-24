@@ -1,7 +1,7 @@
 import os
 import sys
 
-from hls4ml.backends import FPGABackend
+from hls4ml.backends import FPGABackend, get_backend
 from hls4ml.model.flow import register_flow
 from hls4ml.report import parse_vivado_report
 
@@ -12,10 +12,10 @@ class SymbolicExpressionBackend(FPGABackend):
         self._register_flows()
 
     def _register_flows(self):
-        vivado_types = [
-            'vivado:transform_types',
+        specific_types = [
+            'symbolicexpression:transform_types',
         ]
-        vivado_types_flow = register_flow('specific_types', vivado_types, requires=None, backend=self.name)
+        specific_types_flow = register_flow('specific_types', specific_types, requires=None, backend=self.name)
 
         validation_passes = [
             'symbolicexpression:validate_user_lookup_table',
@@ -27,16 +27,27 @@ class SymbolicExpressionBackend(FPGABackend):
         writer_passes = ['make_stamp', 'symbolicexpression:write_hls']
         self._writer_flow = register_flow('write', writer_passes, requires=['vivado:ip'], backend=self.name)
 
-        ip_flow_requirements = [vivado_types_flow, validation_flow, template_flow]
+        ip_flow_requirements = [specific_types_flow, validation_flow, template_flow]
         ip_flow_requirements = list(filter(None, ip_flow_requirements))
 
         self._default_flow = register_flow('ip', None, requires=ip_flow_requirements, backend=self.name)
+
+        # The Catapult path must not pull in the Vivado flows, as they would convert the types to ap_fixed
+        self._catapult_writer_flow = register_flow(
+            'write_catapult', writer_passes, requires=[self._default_flow], backend=self.name
+        )
 
     def get_default_flow(self):
         return self._default_flow
 
     def get_writer_flow(self):
         return self._writer_flow
+
+    def write(self, model):
+        if model.config.get_config_value('Compiler') == 'catapult':
+            model.apply_flow(self._catapult_writer_flow)
+        else:
+            model.apply_flow(self.get_writer_flow())
 
     def create_initial_config(
         self,
@@ -47,6 +58,9 @@ class SymbolicExpressionBackend(FPGABackend):
         compiler='vivado_hls',
         hls_include_path=None,
         hls_libs_path=None,
+        tech='fpga',
+        asiclibs='nangate-45nm',
+        fifo=None,
     ):
         config = {}
 
@@ -55,6 +69,16 @@ class SymbolicExpressionBackend(FPGABackend):
         config['ClockUncertainty'] = clock_uncertainty
         config['IOType'] = io_type if io_type is not None else 'io_parallel'
         config['Compiler'] = compiler if compiler is not None else 'vivado_hls'
+        config['HLSConfig'] = {}
+
+        if config['Compiler'] == 'catapult':
+            config['Technology'] = tech
+            if tech == 'asic':
+                del config['Part']
+                config['ASICLibs'] = asiclibs if asiclibs is not None else 'nangate-45nm'
+            config['FIFO'] = fifo
+            return config
+
         if config['ClockUncertainty'] is None:
             if config['Compiler'] == 'vivado_hls':
                 config['ClockUncertainty'] = '12.5%'
@@ -85,12 +109,42 @@ class SymbolicExpressionBackend(FPGABackend):
                     )
         config['HLSIncludePath'] = hls_include_path
         config['HLSLibsPath'] = hls_libs_path
-        config['HLSConfig'] = {}
 
         return config
 
-    def build(self, model, reset=False, csim=True, synth=True, cosim=False, validation=False, export=False, vsynth=False):
+    def build(
+        self,
+        model,
+        reset=False,
+        csim=True,
+        synth=True,
+        cosim=False,
+        validation=False,
+        export=False,
+        vsynth=False,
+        **kwargs,
+    ):
+        """Build the generated project.
+
+        Extra keyword arguments are only accepted when targeting Catapult, and are passed on to
+        ``CatapultBackend.build`` (e.g., ``vhdl``, ``verilog``, ``power``, ``bup``).
+        """
         compiler = model.config.get_config_value('Compiler')
+
+        if compiler == 'catapult':
+            return get_backend('Catapult').build(
+                model,
+                reset=reset,
+                csim=csim,
+                synth=synth,
+                cosim=cosim,
+                validation=validation,
+                export=export,
+                vsynth=vsynth,
+                **kwargs,
+            )
+        if len(kwargs) > 0:
+            raise TypeError(f'Unexpected build arguments for compiler "{compiler}": {", ".join(kwargs)}')
 
         curr_dir = os.getcwd()
         os.chdir(model.config.get_output_dir())

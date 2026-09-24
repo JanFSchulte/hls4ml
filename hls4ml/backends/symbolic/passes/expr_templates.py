@@ -11,7 +11,36 @@ expr_function_template = 'y[{y_index}] = {expr_str};'
 
 expr_include_list = ['hls_math.h', 'nnet_utils/nnet_math.h']
 
+catapult_expr_include_list = ['nnet_utils/nnet_math.h']
+
 built_in_luts = ['sin_lut', 'cos_lut']
+
+# Functions implemented with AC Math in the Catapult version of nnet_math.h, keyed by the name used by SymPy's C++ printer
+catapult_math_functions = {
+    'sin': 'sin',
+    'cos': 'cos',
+    'tan': 'tan',
+    'asin': 'asin',
+    'acos': 'acos',
+    'atan': 'atan',
+    'atan2': 'atan2',
+    'sinh': 'sinh',
+    'cosh': 'cosh',
+    'tanh': 'tanh',
+    'exp': 'exp',
+    'log': 'log',
+    'log2': 'log2',
+    'log10': 'log10',
+    'sqrt': 'sqrt',
+    'abs': 'abs',
+    'fabs': 'abs',
+    'floor': 'floor',
+    'ceil': 'ceil',
+}
+
+
+def _is_catapult(node):
+    return node.model.config.get_config_value('Compiler') == 'catapult'
 
 
 @requires('sr')
@@ -134,16 +163,91 @@ def get_printer():
     return HLSCodePrinter
 
 
+@requires('sr')
+@lru_cache(maxsize=1)
+def get_catapult_printer():
+    from sympy.core import S
+    from sympy.core.numbers import Integer
+
+    class CatapultCodePrinter(get_printer()):
+        _ns = 'nnet::'
+
+        def __init__(self, layer, lut_functions, use_built_in_luts=False, settings=None):
+            super().__init__(layer, lut_functions, use_built_in_luts=use_built_in_luts, settings=settings)
+            # The parent binds its own _print_math to these names, rebind them to the Catapult version
+            for k in (
+                'Abs Sqrt exp exp2 expm1 log log10 log2 log1p Cbrt hypot fma'
+                ' loggamma sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh '
+                'atanh erf erfc loggamma gamma ceiling floor'
+            ).split():
+                setattr(CatapultCodePrinter, '_print_%s' % k, CatapultCodePrinter._print_math)
+
+        def _print_number(self, expr):
+            return self._wrap_with_type_name(repr(float(expr.evalf())))
+
+        def _print_Pow(self, expr):
+            if expr.is_number:
+                return self._print_number(expr)
+            type_name = self.layer.types['result_t'].name
+            base = self._print(expr.base)
+            if isinstance(expr.exp, Integer) and expr.exp < 0:
+                pos_pow = self._print(expr.base ** (-expr.exp))
+                return f'{self._ns}recip<{type_name}>(({type_name})({pos_pow}))'
+            elif isinstance(expr.exp, Integer):
+                return super()._print_Pow(expr)
+            elif expr.exp == S.Half:
+                return f'{self._ns}sqrt<{type_name}>(({type_name})({base}))'
+            else:
+                exp = self._print(expr.exp)
+                return f'{self._ns}pow<{type_name}>(({type_name})({base}), ({type_name})({exp}))'
+
+        def _print_math(self, expr):
+            if expr.is_number:
+                return self._print_number(expr)
+
+            name = self.known_functions[expr.__class__.__name__]
+            if not isinstance(name, str):
+                for cb, fname in name:
+                    if cb(*expr.args):
+                        name = fname
+                        break
+                else:
+                    raise ValueError('No matching printer')
+
+            type_name = self.layer.types['result_t'].name
+            cast = f'({type_name})'
+            args = ', '.join(f'{cast}({self._print(arg)})' for arg in expr.args)
+
+            if self.use_built_in_luts and name + '_lut' in built_in_luts:
+                name = name + '_lut'
+            elif name in catapult_math_functions:
+                name = catapult_math_functions[name]
+            else:
+                raise NotImplementedError(
+                    f'Function "{expr.func.__name__}" is not supported by SymbolicExpression with Catapult HLS. '
+                    f'Supported functions: {", ".join(sorted(set(catapult_math_functions.values())))}.'
+                )
+
+            return f'{self._ns}{name}<{type_name}>({args})'
+
+    return CatapultCodePrinter
+
+
 class ExpressionFunctionTemplate(FunctionCallTemplate):
     def __init__(self):
         super().__init__(SymbolicExpression, include_header=expr_include_list)
         self.template = expr_function_template
 
+    def transform(self, model, node):
+        self.include_header = catapult_expr_include_list if _is_catapult(node) else expr_include_list
+        return super().transform(model, node)
+
     def format(self, node):
         params = self._default_function_params(node)
 
         lut_functions = {lut_fun.name: lut_fun.name for lut_fun in params['lut_functions']}
-        printer = get_printer()(node, lut_functions=lut_functions, use_built_in_luts=node.attributes['use_built_in_luts'])
+        printer_cls = get_catapult_printer() if _is_catapult(node) else get_printer()
+        printer = printer_cls(node, lut_functions=lut_functions, use_built_in_luts=node.attributes['use_built_in_luts'])
 
         fn_templates = []
         for i, expr in enumerate(node.attributes['expression']):
@@ -164,7 +268,7 @@ class ExpressionConfigTemplate(LayerConfigTemplate):
         lut_defs = []
         for lut_fun in params['lut_functions']:
             type_name = params['result_t'].name
-            if lut_fun.math_func in ['sinpi', 'cospi', 'sin', 'cos', 'asin', 'acos', 'atan', 'atan2']:
+            if _is_catapult(node) or lut_fun.math_func in ['sinpi', 'cospi', 'sin', 'cos', 'asin', 'acos', 'atan', 'atan2']:
                 # We have return type overrides for these functions
                 namespace = 'nnet::'
             else:

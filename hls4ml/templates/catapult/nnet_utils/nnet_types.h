@@ -61,7 +61,7 @@ template <typename T, unsigned N, T (*func)(T)> class lookup_table {
     }
 
     T operator()(T n) const {
-        int index = (n - range_start) * base_div;
+        int index = ((n - range_start) * base_div).to_int();
         if (index < 0)
             index = 0;
         else if (index > N - 1)

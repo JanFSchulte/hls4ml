@@ -440,23 +440,30 @@ def convert_from_symbolic_expression(
         clock_period (int, optional): Clock period of the design.
             Defaults to 5.
         hls_compiler (str, optional): HLS compiler to use.
-            Must be ``'vivado_hls'`` or ``'vitis_hls'`. Defaults to ``'vivado_hls'``.
+            Must be ``'vivado_hls'``, ``'vitis_hls'`` or ``'catapult'``. Defaults to ``'vivado_hls'``. With
+            ``'catapult'``, the math functions are implemented with the AC Math library, and the ``tech``,
+            ``asiclibs`` and ``fifo`` arguments of the Catapult backend can be passed.
         hls_include_path (str, optional): Path to HLS include files. If `None` the location will be inferred from the
             location of the compiler. If an empty string is passed the HLS math libraries won't be used during
             compilation, meaning Python integration won't work unless all functions are LUT-based. Doesn't affect synthesis.
-            Defaults to None.
+            Not used with ``'catapult'``. Defaults to None.
         hls_libs_path (str, optional): Path to HLS libs files. If `None` the location will be inferred from the
-            location of the compiler. Defaults to None.
+            location of the compiler. Not used with ``'catapult'``. Defaults to None.
 
     Returns:
         ModelGraph: hls4ml model.
     """
-    _valid_compilers = ('vivado_hls', 'vitis_hls')
+    _valid_compilers = ('vivado_hls', 'vitis_hls', 'catapult')
     if hls_compiler not in _valid_compilers:
         raise ValueError(f"hls_compiler must be one of {_valid_compilers}, got '{hls_compiler}'")
 
     # Remove legacy 'compiler' kwarg if passed to avoid duplicate keyword argument
     kwargs.pop('compiler', None)
+
+    if hls_compiler == 'catapult':
+        for arg in ('hls_include_path', 'hls_libs_path', 'clock_uncertainty'):
+            if kwargs.pop(arg, None):
+                print(f'WARNING: "{arg}" is not used with the Catapult HLS compiler and will be ignored.')
 
     import sympy
 
