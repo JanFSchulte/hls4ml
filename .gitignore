@@ -18,7 +18,12 @@ hls4mlprj_*
 
 # HEPT demo/training scratch (see hls4ml/convertSimpleHEPT.py, train_simple_hept*.py)
 hls4ml/hept_test/
+hls4ml/hept_test_*/
 hls4ml/data/
+# HEPT P&R/synthesis scratch dirs and ad hoc baseline/scratch scripts
+hls4ml/HEPT/
+hls4ml/baseline.txt
+hls4ml/scratch_synth_baseline.py
 # pixi environments
 .pixi/*
 !.pixi/config.toml
