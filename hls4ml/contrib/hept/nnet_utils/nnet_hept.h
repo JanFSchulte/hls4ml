@@ -39,7 +39,18 @@ struct hept_config {
     typedef float coords_t;
     typedef float shift_t;
     typedef float output_t;
-    typedef float weight_t;
+    // Independently-settable per-weight-array types (split out from a single shared
+    // `weight_t` so each weight array can take its own HLSConfig Precision override,
+    // e.g. for HGQ-learned per-layer bit-widths). q/k/v share one type since they are
+    // always trained/quantized together in practice; every other weight array (and
+    // sqrt_w, alpha, layer norm) is fully independent.
+    typedef float qkv_weight_t;
+    typedef float sqrt_w_t;
+    typedef float alpha_t;
+    typedef float out_linear_weight_t;
+    typedef float out_linear_bias_t;
+    typedef float layer_norm_weight_t;
+    typedef float layer_norm_bias_t;
     typedef float accum_t;
 
     typedef float norm_accum_t;
@@ -74,8 +85,8 @@ struct hept_layernorm_config : nnet::layernorm_config {
     typedef typename CONFIG_T::norm_sum_sqr_t sum_sqr_t;
     typedef typename CONFIG_T::norm_mean_t mean_t;
     typedef typename CONFIG_T::norm_sum_t sum_t;
-    typedef typename CONFIG_T::weight_t bias_t;
-    typedef typename CONFIG_T::weight_t scale_t;
+    typedef typename CONFIG_T::layer_norm_bias_t bias_t;
+    typedef typename CONFIG_T::layer_norm_weight_t scale_t;
     typedef typename CONFIG_T::norm_accum_t accum_t;
     static const unsigned par_factor = CONFIG_T::par_factor;
 };
@@ -86,7 +97,8 @@ struct hept_qkv_config : nnet::qkv_config {
     static const unsigned dim_per_head = CONFIG_T::dim_per_head;
     static const unsigned seq_len = CONFIG_T::seq_len;
     static const unsigned num_w_per_dist = CONFIG_T::num_w_per_dist;
-    typedef typename CONFIG_T::weight_t weight_t;
+    typedef typename CONFIG_T::qkv_weight_t weight_t;
+    typedef typename CONFIG_T::sqrt_w_t sqrt_w_t;
     typedef typename CONFIG_T::accum_t accum_t;
     typedef typename CONFIG_T::qkv_exp_table_t exp_table_t;
     typedef typename CONFIG_T::qkv_sqrt_table_t sqrt_table_t;
@@ -105,7 +117,9 @@ struct hept_e2lsh_config : nnet::e2lsh_config {
     static const unsigned num_hashes = CONFIG_T::num_hashes;
     static const unsigned seq_len = CONFIG_T::seq_len;
     static const unsigned num_w_per_dist = CONFIG_T::num_w_per_dist;
-    typedef typename CONFIG_T::weight_t weight_t;
+    typedef typename CONFIG_T::alpha_t alpha_t;
+    typedef typename CONFIG_T::out_linear_weight_t out_linear_weight_t;
+    typedef typename CONFIG_T::out_linear_bias_t out_linear_bias_t;
     typedef typename CONFIG_T::accum_t accum_t;
     typedef typename CONFIG_T::e2lsh_exp_table_t exp_table_t;
     static const unsigned exp_table_size = CONFIG_T::e2lsh_exp_table_size;
@@ -183,15 +197,15 @@ void hept_attention(
     hls::stream<coords_T> &coords,
     hls::stream<shift_T> &combined_shifts,
     hls::stream<output_T> &out,
-    typename CONFIG_T::weight_t layer_norm_weight[CONFIG_T::embed_dim],
-    typename CONFIG_T::weight_t layer_norm_bias[CONFIG_T::embed_dim],
-    typename CONFIG_T::weight_t q_weight[CONFIG_T::dim_per_head * CONFIG_T::dim_per_head * CONFIG_T::num_heads],
-    typename CONFIG_T::weight_t k_weight[CONFIG_T::dim_per_head * CONFIG_T::dim_per_head * CONFIG_T::num_heads],
-    typename CONFIG_T::weight_t v_weight[CONFIG_T::dim_per_head * CONFIG_T::dim_per_head * CONFIG_T::num_heads],
-    typename CONFIG_T::weight_t sqrt_w[CONFIG_T::num_heads * CONFIG_T::coords_dim],
-    typename CONFIG_T::weight_t alpha[(CONFIG_T::num_w_per_dist + 2 * CONFIG_T::coords_dim) * CONFIG_T::num_hashes * CONFIG_T::num_heads],
-    typename CONFIG_T::weight_t out_linear_weight[CONFIG_T::num_heads * CONFIG_T::dim_per_head * CONFIG_T::dim_per_head],
-    typename CONFIG_T::weight_t out_linear_bias[CONFIG_T::dim_per_head]
+    typename CONFIG_T::layer_norm_weight_t layer_norm_weight[CONFIG_T::embed_dim],
+    typename CONFIG_T::layer_norm_bias_t layer_norm_bias[CONFIG_T::embed_dim],
+    typename CONFIG_T::qkv_weight_t q_weight[CONFIG_T::dim_per_head * CONFIG_T::dim_per_head * CONFIG_T::num_heads],
+    typename CONFIG_T::qkv_weight_t k_weight[CONFIG_T::dim_per_head * CONFIG_T::dim_per_head * CONFIG_T::num_heads],
+    typename CONFIG_T::qkv_weight_t v_weight[CONFIG_T::dim_per_head * CONFIG_T::dim_per_head * CONFIG_T::num_heads],
+    typename CONFIG_T::sqrt_w_t sqrt_w[CONFIG_T::num_heads * CONFIG_T::coords_dim],
+    typename CONFIG_T::alpha_t alpha[(CONFIG_T::num_w_per_dist + 2 * CONFIG_T::coords_dim) * CONFIG_T::num_hashes * CONFIG_T::num_heads],
+    typename CONFIG_T::out_linear_weight_t out_linear_weight[CONFIG_T::num_heads * CONFIG_T::dim_per_head * CONFIG_T::dim_per_head],
+    typename CONFIG_T::out_linear_bias_t out_linear_bias[CONFIG_T::dim_per_head]
 ) {
     #pragma HLS DATAFLOW
 
@@ -233,6 +247,14 @@ void hept_attention(
     hls::stream<typename CONFIG_T::coords_t> coords_scalar[COORD_LANES];
     hls::stream<typename CONFIG_T::shift_t> shifts_scalar[SHIFT_LANES];
     hls::stream<typename CONFIG_T::norm_out_t> layernorm_out[FEATURE_LANES];
+    // This depth-2 FIFO's default SRL (LUT shift-register) implementation is a single
+    // atomic placed unit with no flexibility to move across an Alveo U250's SLR die
+    // boundaries -- on the num_heads=1 HGQ P&R attempt this consistently left exactly
+    // one lane's FIFO stranded with 2 unroutable pins regardless of place/route
+    // directive (SSI_SpreadLogic_high, AlternateCLBRouting, SSI_BalanceSLLs all hit the
+    // identical 2 pins). Forcing BRAM storage gives the placer a relocatable hard-macro
+    // site instead, at a small BRAM-tile cost (array has FEATURE_LANES lanes).
+#pragma HLS BIND_STORAGE variable=layernorm_out type=fifo impl=bram
 
     hls::stream<typename CONFIG_T::prepare_qk_t> q_hat[QK_LANES];
     hls::stream<typename CONFIG_T::prepare_qk_t> q_hat_1[QK_LANES];
@@ -245,16 +267,23 @@ void hept_attention(
     hls::stream<typename CONFIG_T::combined_shift_out_t> q_hashed_combined[HEAD_HASH][CONFIG_T::par_factor_sort];
     hls::stream<typename CONFIG_T::combined_shift_out_t> k_hashed_combined[HEAD_HASH][CONFIG_T::par_factor_sort];
 
+    // bucket_sort_single emits each token's RANK (sorted-bucket position), indexed by
+    // original stream position -- it is NOT its own inverse in general. Gathering into
+    // bucket-sorted order needs the true source-index permutation (rank inverted via
+    // invert_permutation_single); gathering back out of bucket-sorted order into original
+    // order needs the raw rank. Q needs the raw rank twice downstream (the two unsort
+    // steps) plus once into the inverter; K/V only ever need the inverted permutation.
     hls::stream<typename CONFIG_T::sorted_index_t> q_hashed_index[HEAD_HASH][CONFIG_T::par_factor_sort];
     hls::stream<typename CONFIG_T::sorted_index_t> q_hashed_index_1[HEAD_HASH][CONFIG_T::par_factor_sort];
+    hls::stream<typename CONFIG_T::sorted_index_t> q_hashed_index_2a[HEAD_HASH][CONFIG_T::par_factor_sort];
     hls::stream<typename CONFIG_T::sorted_index_t> q_hashed_index_2[HEAD_HASH][CONFIG_T::par_factor_sort];
+    hls::stream<typename CONFIG_T::sorted_index_t> q_hashed_index_3[HEAD_HASH][CONFIG_T::par_factor_sort];
     hls::stream<typename CONFIG_T::sorted_index_t> k_hashed_index[HEAD_HASH][CONFIG_T::par_factor_sort];
-    hls::stream<typename CONFIG_T::sorted_index_t> k_hashed_index_1[HEAD_HASH][CONFIG_T::par_factor_sort];
-    hls::stream<typename CONFIG_T::sorted_index_t> k_hashed_index_2[HEAD_HASH][CONFIG_T::par_factor_sort];
 
     hls::stream<typename CONFIG_T::sorted_index_t> rev_q_hashed_index[HEAD_HASH][CONFIG_T::par_factor_sort];
-    hls::stream<typename CONFIG_T::sorted_index_t> rev_q_hashed_index_1[HEAD_HASH][CONFIG_T::par_factor_sort];
-    hls::stream<typename CONFIG_T::sorted_index_t> rev_q_hashed_index_2[HEAD_HASH][CONFIG_T::par_factor_sort];
+    hls::stream<typename CONFIG_T::sorted_index_t> rev_k_hashed_index[HEAD_HASH][CONFIG_T::par_factor_sort];
+    hls::stream<typename CONFIG_T::sorted_index_t> rev_k_hashed_index_1[HEAD_HASH][CONFIG_T::par_factor_sort];
+    hls::stream<typename CONFIG_T::sorted_index_t> rev_k_hashed_index_2[HEAD_HASH][CONFIG_T::par_factor_sort];
 
     hls::stream<typename CONFIG_T::batched_index_select_out_t> batched_q[HEAD_HASH][BATCHED_QK_LANES];
     hls::stream<typename CONFIG_T::batched_index_select_out_t> batched_k[HEAD_HASH][BATCHED_QK_LANES];
@@ -330,37 +359,49 @@ void hept_attention(
                                  typename CONFIG_T::sorted_index_t,
                                  e2lsh_cfg>(k_hashed_combined[i], k_hashed_index[i]);
 
+        // Q: raw rank needs 3 live copies downstream -- one into the inverter (yields the
+        // true source-index permutation consumed by the initial gather below), two kept
+        // raw for the two "unsort" scatter-back steps later (which need the forward rank,
+        // not its inverse).
         nnet::clone_stream<typename CONFIG_T::sorted_index_t, typename CONFIG_T::sorted_index_t,
                            e2lsh_cfg::seq_len, e2lsh_cfg::par_factor_sort>(
-            q_hashed_index[i], q_hashed_index_1[i], q_hashed_index_2[i]
+            q_hashed_index[i], q_hashed_index_1[i], q_hashed_index_2a[i]
         );
         nnet::clone_stream<typename CONFIG_T::sorted_index_t, typename CONFIG_T::sorted_index_t,
                            e2lsh_cfg::seq_len, e2lsh_cfg::par_factor_sort>(
-            k_hashed_index[i], k_hashed_index_1[i], k_hashed_index_2[i]
+            q_hashed_index_2a[i], q_hashed_index_2[i], q_hashed_index_3[i]
         );
 
         nnet::invert_permutation_single<typename CONFIG_T::sorted_index_t,
                                         typename CONFIG_T::sorted_index_t,
                                         e2lsh_cfg>(q_hashed_index_1[i], rev_q_hashed_index[i]);
 
+        // K: both downstream gathers (K itself, and V which must land in K's bucket
+        // order) need the true source-index permutation -- invert once and clone the
+        // inverted stream; no raw K rank is needed anywhere else.
+        nnet::invert_permutation_single<typename CONFIG_T::sorted_index_t,
+                                        typename CONFIG_T::sorted_index_t,
+                                        e2lsh_cfg>(k_hashed_index[i], rev_k_hashed_index[i]);
         nnet::clone_stream<typename CONFIG_T::sorted_index_t, typename CONFIG_T::sorted_index_t,
                            e2lsh_cfg::seq_len, e2lsh_cfg::par_factor_sort>(
-            rev_q_hashed_index[i], rev_q_hashed_index_1[i], rev_q_hashed_index_2[i]
+            rev_k_hashed_index[i], rev_k_hashed_index_1[i], rev_k_hashed_index_2[i]
         );
     }
 
+    // Initial gather into bucket-sorted order consumes the INVERTED permutation
+    // (source-index-per-sorted-slot), not the raw rank -- see declarations above.
     nnet::batched_index_select<typename CONFIG_T::sorted_index_t,
                                typename CONFIG_T::prepare_qk_t,
                                typename CONFIG_T::batched_index_select_out_t,
-                               e2lsh_cfg>(q_hashed_index_2, q_hat_2, batched_q);
+                               e2lsh_cfg>(rev_q_hashed_index, q_hat_2, batched_q);
     nnet::batched_index_select<typename CONFIG_T::sorted_index_t,
                                typename CONFIG_T::prepare_qk_t,
                                typename CONFIG_T::batched_index_select_out_t,
-                               e2lsh_cfg>(k_hashed_index_1, k_hat_2, batched_k);
+                               e2lsh_cfg>(rev_k_hashed_index_1, k_hat_2, batched_k);
     nnet::batched_index_select_2<typename CONFIG_T::sorted_index_t,
                                  typename CONFIG_T::prepare_qk_t,
                                  typename CONFIG_T::batched_index_select_out_t,
-                                 e2lsh_cfg>(k_hashed_index_2, v, batched_v);
+                                 e2lsh_cfg>(rev_k_hashed_index_2, v, batched_v);
 
     nnet::qkv_res<typename CONFIG_T::batched_index_select_out_t,
                   typename CONFIG_T::qkv_res_out_denom_t,
@@ -370,25 +411,33 @@ void hept_attention(
     UNSORT_HEAD:
     for (int h = 0; h < CONFIG_T::num_heads; ++h) {
         #pragma HLS UNROLL
-        const int hash_offset = h * CONFIG_T::num_hashes;
         const int o_offset = h * CONFIG_T::dim_per_head * CONFIG_T::par_factor;
         const int logits_offset = h * CONFIG_T::par_factor;
 
+        // Unsort (scatter attention results from bucket-sorted order back to original
+        // token order) needs the RAW rank, not the inverted permutation -- the mirror
+        // image of the initial gather above. Pass the FULL hash-major arrays plus `h`
+        // (not a pre-sliced &arr[h*num_hashes] sub-array) -- q_hashed_index_2/_3 and
+        // so/denom are indexed hash*num_head+head everywhere else in this kernel, so a
+        // fixed head's num_hashes elements are strided by num_head, not contiguous; the
+        // callee now applies that stride internally.
         nnet::batched_index_select_unsort_o_num_hash<typename CONFIG_T::sorted_index_t,
                                                      typename CONFIG_T::qkv_res_out_so_t,
                                                      typename CONFIG_T::batched_index_select_unsort_out_o_t,
                                                      e2lsh_cfg>(
-            &rev_q_hashed_index_1[hash_offset],
-            &so[hash_offset],
-            &o[o_offset]
+            q_hashed_index_2,
+            so,
+            &o[o_offset],
+            h
         );
         nnet::batched_index_select_unsort_logits_num_hash<typename CONFIG_T::sorted_index_t,
                                                           typename CONFIG_T::qkv_res_out_denom_t,
                                                           typename CONFIG_T::batched_index_select_unsort_out_logits_t,
                                                           e2lsh_cfg>(
-            &rev_q_hashed_index_2[hash_offset],
-            &denom[hash_offset],
-            &logits[logits_offset]
+            q_hashed_index_3,
+            denom,
+            &logits[logits_offset],
+            h
         );
     }
 

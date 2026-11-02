@@ -34,7 +34,13 @@ _HEPT_CONFIG_TEMPLATE = """struct config{index} : nnet::hept_config {{
     typedef {coords_t} coords_t;
     typedef {shift_t} shift_t;
     typedef {output_t} output_t;
-    typedef {weight_t} weight_t;
+    typedef {qkv_weight_t} qkv_weight_t;
+    typedef {sqrt_w_t} sqrt_w_t;
+    typedef {alpha_t} alpha_t;
+    typedef {out_linear_weight_t} out_linear_weight_t;
+    typedef {out_linear_bias_t} out_linear_bias_t;
+    typedef {layer_norm_weight_t} layer_norm_weight_t;
+    typedef {layer_norm_bias_t} layer_norm_bias_t;
     typedef {accum_t} accum_t;
 
     typedef {norm_accum_t} norm_accum_t;
@@ -80,9 +86,27 @@ _HEPT_FUNCTION_TEMPLATE = """nnet::hept_attention<{input_t}, {coords_t}, {shift_
 _DEFAULT_TYPE_STRINGS = {
     "input_t": "ap_fixed<16,6>",
     "coords_t": "ap_fixed<16,6>",
-    "shift_t": "ap_fixed<16,6>",
+    # Explicit AP_RND_CONV: this is data_T_combined_shifts, the exact multiplicand in
+    # lsh_mapping_combined_shift's tmp_q/tmp_k = col_buffer + hashed_shift*combined_shift
+    # computation that directly produces the bucket-sort key -- Vitis's unspecified
+    # default (AP_TRN, truncate toward -inf) biases this value low on every conversion
+    # from the wider upstream float/accum_t source, same class of issue as accum_t above.
+    "shift_t": "ap_fixed<16,6,AP_RND_CONV,AP_WRAP,0>",
     "output_t": "ap_fixed<16,6>",
-    "accum_t": "ap_fixed<62,38>",
+    # Explicit AP_RND_CONV: Vitis's default (unspecified) rounding mode for ap_fixed is
+    # AP_TRN (truncate toward -inf), which silently biases every narrowing accumulation
+    # step in this type low. That bias cascades through the LSH hash chain (row_max/
+    # row_min/hashed_shift/tmp_q/tmp_k all use accum_t) into bucket_sort_single's final
+    # floor-based bucket assignment: a true hash value just above an integer boundary
+    # (e.g. 13.03) can get truncated to just below it (e.g. 12.99) before the floor ever
+    # runs, assigning the wrong bucket. Round-to-nearest removes this systematic bias
+    # without changing the floor semantics the bucket assignment correctly relies on
+    # (see hept.py's _clamp_floor_ste -- floor is the reference's actual behavior, this
+    # only fixes what gets floored). accum_t is also the general wide accumulator for
+    # layernorm/QKV computation elsewhere in this kernel; round-to-nearest is strictly
+    # more accurate than truncation there too, so this is a uniform improvement, not a
+    # narrow hash-chain-only patch.
+    "accum_t": "ap_fixed<62,38,AP_RND_CONV,AP_WRAP,0>",
     "norm_accum_t": "ap_fixed<32,10>",
     "norm_sum_t": "ap_fixed<18,8,AP_RND_CONV,AP_WRAP,0>",
     "norm_sum_sqr_t": "ap_fixed<18,8,AP_RND_CONV,AP_WRAP,0>",
@@ -92,6 +116,13 @@ _DEFAULT_TYPE_STRINGS = {
     "qkv_sqrt_table_t": "ap_ufixed<18,8,AP_RND_CONV,AP_SAT,0>",
     "e2lsh_exp_table_t": "ap_ufixed<64,20,AP_RND_CONV,AP_SAT,0>",
     "hash_mul_accum_t": "ap_fixed<32,16,AP_RND_CONV,AP_WRAP,0>",
+    # Narrowed from the wide accum_t (col_buffer + hashed_shift*combined_shift_index)
+    # immediately before bucket_sort_single's explicit [0,31] clamp -- this is the ONLY
+    # use of this type (feeds q_hashed_combined/k_hashed_combined, consumed solely by
+    # bucket_sort_single), so it must saturate rather than wrap: a wrapped out-of-range
+    # value can land anywhere in-range and silently produce a wrong bucket instead of
+    # being correctly clamped.
+    "combined_shift_out_t": "ap_fixed<16,6,AP_RND_CONV,AP_SAT,0>",
 }
 
 
@@ -117,7 +148,20 @@ class HEPTConfigTemplate(LayerConfigTemplate):
             raise ValueError("HEPTAttention currently requires IOType='io_stream'.")
 
         params = self._default_config_params(node)
-        params["weight_t"] = node.get_weights("q_weight").type.name
+        # Each weight array gets its own type, read individually from hls4ml's own
+        # per-weight-variable precision resolution (so a `LayerName.<this>.Precision.
+        # <weight_var>` override in HLSConfig takes effect independently per array,
+        # e.g. for HGQ-learned per-layer bit-widths). q/k/v share one type since they
+        # are always trained/quantized together in practice; absent any override,
+        # every weight defaults to the same model-wide Precision as before, so this
+        # is behaviorally identical to the old shared `weight_t` when unconfigured.
+        params["qkv_weight_t"] = node.get_weights("q_weight").type.name
+        params["sqrt_w_t"] = node.get_weights("sqrt_w").type.name
+        params["alpha_t"] = node.get_weights("alpha").type.name
+        params["out_linear_weight_t"] = node.get_weights("out_linear_weight").type.name
+        params["out_linear_bias_t"] = node.get_weights("out_linear_bias").type.name
+        params["layer_norm_weight_t"] = node.get_weights("layer_norm_weight").type.name
+        params["layer_norm_bias_t"] = node.get_weights("layer_norm_bias").type.name
 
         params["input_t"] = _type_name(node.get_attr("input_t", None), _DEFAULT_TYPE_STRINGS["input_t"])
         params["coords_t"] = _type_name(node.get_attr("coords_t", None), _DEFAULT_TYPE_STRINGS["coords_t"])
@@ -149,7 +193,9 @@ class HEPTConfigTemplate(LayerConfigTemplate):
 
         params["norm_out_t"] = _type_name(node.get_attr("norm_out_t", None), params["input_t"])
         params["prepare_qk_t"] = _type_name(node.get_attr("prepare_qk_t", None), params["input_t"])
-        params["combined_shift_out_t"] = _type_name(node.get_attr("combined_shift_out_t", None), params["input_t"])
+        params["combined_shift_out_t"] = _type_name(
+            node.get_attr("combined_shift_out_t", None), _DEFAULT_TYPE_STRINGS["combined_shift_out_t"]
+        )
 
         seq_len = int(node.get_attr("seq_len"))
         index_width = max(1, math.ceil(math.log2(max(2, seq_len))))

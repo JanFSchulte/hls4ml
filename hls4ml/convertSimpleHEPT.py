@@ -63,6 +63,17 @@ class PseudoHEPT(nn.Module):
 def reference_attention(model, x, coords, combined_shifts):
     """PyTorch reference for the attention sub-block the HLS kernel implements (`aggr_out`)."""
     hept = model.attn
+    # hls_bucket_range/hls_bucket_emulate_sort are plain Python attributes set dynamically
+    # during QAT training (tracking_trainer_qat.py's set_bucket_range_training) -- they are
+    # NOT part of the state_dict, so a freshly-constructed+loaded model (as here) never has
+    # them set. Without hls_bucket_range, hept.py's forward() skips the clamp+floor
+    # discretization and argsort runs in default (stable=False) mode directly on the
+    # continuous hash value -- a materially different sort (effectively unique per-token
+    # rank, no ties) from the HLS kernel's actual clamp-to-[0,31]+floor+stable bucket sort.
+    # Set them here so this reference faithfully reproduces what the HLS kernel implements,
+    # matching the bucket range/emulate_sort defaults train_simple_hept_qat.py trains with.
+    hept.attn.hls_bucket_range = (0.0, 31.0)
+    hept.attn.hls_bucket_emulate_sort = True
     with torch.no_grad():
         x_normed = hept.norm1(torch.tensor(x))  # pe_type == "none" -> no positional encoding
         q = hept.w_q(x_normed)
@@ -175,6 +186,50 @@ def main():
         help="Path to the full Transformer state dict (best_model.pt) providing feat_encoder "
         "weights for --real-data. Defaults to 'best_model.pt' next to --checkpoint.",
     )
+    parser.add_argument(
+        "--par-factor",
+        type=int,
+        default=PAR_FACTOR,
+        help=f"Override hls_config['Model']['par_factor'] (default: {PAR_FACTOR}). Lower values "
+        "time-multiplex more (higher qkv_reuse_factor/inter_reuse_factor, less DSP) at the cost "
+        "of higher latency/II.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=OUTPUT_DIR,
+        help=f"Override the hls4ml project output directory (default: '{OUTPUT_DIR}').",
+    )
+    parser.add_argument(
+        "--hgq-precision",
+        action="store_true",
+        help="Apply a per-weight ap_fixed precision (e.g. learned by an HGQ QAT run) to "
+        "q_weight/k_weight/v_weight/out_linear_weight/out_linear_bias, via per-weight "
+        "LayerName.attn.Precision overrides. Requires the contrib/hept per-weight-array "
+        "typedefs (qkv_weight_t/out_linear_weight_t/etc.) -- a single shared weight_t cannot "
+        "express this. Defaults below match the num_heads=2 HGQ run "
+        "(data/tracking/logs/10_20-15_06_04.4189_trans_hept_qat_42_hgq_realrun2_calibrated); "
+        "override with --qkv-precision/--out-linear-weight-precision/--out-linear-bias-precision "
+        "for a different checkpoint's learned precision (note: q/k/v share ONE type in the "
+        "generated C++ today, read from q_weight only -- pass the widest of the three if they "
+        "differ, e.g. widest integer-bit count, to avoid silently truncating k/v's or losing "
+        "whichever of the three isn't q).",
+    )
+    parser.add_argument(
+        "--qkv-precision", type=str, default="ap_fixed<6,1>", help="See --hgq-precision."
+    )
+    parser.add_argument(
+        "--out-linear-weight-precision", type=str, default="ap_fixed<6,1>", help="See --hgq-precision."
+    )
+    parser.add_argument(
+        "--out-linear-bias-precision", type=str, default="ap_fixed<8,1>", help="See --hgq-precision."
+    )
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=None,
+        help="Override model_kwargs.num_heads (must match the architecture of any --checkpoint).",
+    )
     args = parser.parse_args()
 
     if args.real_data and not args.checkpoint:
@@ -185,6 +240,8 @@ def main():
 
     config_dir = Path(f"./HEPT/src/configs/tracking/tracking_trans_{args.model}.yaml")
     model_kwargs = yaml.safe_load(config_dir.open("r").read())["model_kwargs"]
+    if args.num_heads is not None:
+        model_kwargs["num_heads"] = args.num_heads
     embed_dim = model_kwargs["h_dim"]
     num_heads_x_hashes = model_kwargs["num_heads"] * model_kwargs["n_hashes"]
 
@@ -222,12 +279,51 @@ def main():
         channels_last_conversion="off",
         transpose_outputs=False,
     )
-    hls_config["Model"]["par_factor"] = PAR_FACTOR
+    hls_config["Model"]["par_factor"] = args.par_factor
+
+    # alpha (the LSH hash-projection weight consumed by lsh_mapping_combined_shift) has
+    # no dedicated contrib/hept type -- it falls back to hls4ml's library-wide
+    # model_default_t (ap_fixed<16,6>, no explicit rounding mode -> Vitis's default
+    # AP_TRN/truncate-toward-negative-infinity). That silently biases every alpha
+    # weight value low relative to its trained float value; summed over the
+    # dim_per_head+coords_dim hash-projection terms, this compounds into a systematic,
+    # one-directional error in the hash key large enough to flip tokens across an
+    # integer bucket boundary (confirmed: PyTorch-vs-HLS reference values sitting just
+    # above a floor boundary get floored to one bucket too low). Fixing it here with a
+    # narrow LayerName override (not a global model_default_t/library-default change)
+    # keeps the blast radius limited to this one weight array.
+    # sqrt_w has the identical model_default_t fallback and feeds q_hat/k_hat (the
+    # "prepared" Q/K that lsh_mapping_combined_shift hashes) -- same rounding-bias risk.
+    hls_config.setdefault("LayerName", {}).setdefault("attn", {}).setdefault("Precision", {}).update(
+        {
+            "alpha": "ap_fixed<16,6,AP_RND_CONV,AP_WRAP,0>",
+            "sqrt_w": "ap_fixed<16,6,AP_RND_CONV,AP_WRAP,0>",
+            "layer_norm_weight": "ap_fixed<16,6,AP_RND_CONV,AP_WRAP,0>",
+            "layer_norm_bias": "ap_fixed<16,6,AP_RND_CONV,AP_WRAP,0>",
+        }
+    )
+    # Experimental: prepare_qk_t (q_hat/k_hat, the values actually multiplied by alpha
+    # in the hash) is not a declared weight/TypeAttribute on HEPTAttention -- testing
+    # whether a raw top-level LayerName.attn key reaches node.get_attr() anyway.
+    hls_config["LayerName"]["attn"]["prepare_qk_t"] = "ap_fixed<16,6,AP_RND_CONV,AP_WRAP,0>"
+
+    if args.hgq_precision:
+        # Merge into (not overwrite) LayerName.attn.Precision -- the alpha override
+        # above must survive this block running after it.
+        hls_config.setdefault("LayerName", {}).setdefault("attn", {}).setdefault("Precision", {}).update(
+            {
+                "q_weight": args.qkv_precision,
+                "k_weight": args.qkv_precision,
+                "v_weight": args.qkv_precision,
+                "out_linear_weight": args.out_linear_weight_precision,
+                "out_linear_bias": args.out_linear_bias_precision,
+            }
+        )
 
     hls_model = convert_from_pytorch_model(
         model,
         hls_config=hls_config,
-        output_dir=OUTPUT_DIR,
+        output_dir=args.output_dir,
         backend=BACKEND,
         io_type=IO_TYPE,
     )

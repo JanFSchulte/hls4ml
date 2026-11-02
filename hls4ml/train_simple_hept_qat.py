@@ -43,7 +43,13 @@ def main():
         "--pretraining-epochs",
         type=int,
         default=0,
-        help="Full-precision warm-up epochs before quantization kicks in.",
+        help="Full-precision warm-up epochs before quantization kicks in. IMPORTANT when --disable-hgq is "
+        "NOT set: pquant 0.1.0's PQWeightBiasBase.hgq_loss() hardcodes `if self.is_pretraining: return 0.0`, "
+        "and `is_pretraining` is only ever cleared inside pquant's own pretraining loop (core/torch/train.py), "
+        "which is skipped entirely when pretraining_epochs == 0 -- so with the default of 0, HGQ's EBOPs "
+        "resource loss silently NEVER activates (confirmed empirically: hgq_loss logged as exactly 0.000000 "
+        "every epoch) and no bit-width compression happens at all, regardless of --hgq-beta. Pass at least "
+        "1 to actually enable HGQ's bit-width search.",
     )
     parser.add_argument(
         "--total-bits",
@@ -133,9 +139,57 @@ def main():
         "training is enabled -- the LSH range penalty backprops through prep_qk's exp(clamp(., max=50)) "
         "term, which can produce very large/unstable gradients without clipping. Pass 0 to disable.",
     )
+    parser.add_argument(
+        "--disable-hgq",
+        action="store_true",
+        help="Disable PQuant's HGQ (High Granularity Quantization) per-weight/per-activation trainable "
+        "bit-width search -- on by default, which replaces the plain fixed ap_fixed<total_bits,integer_bits> "
+        "fake-quant with a per-element search (starting from that same precision) regularized down by "
+        "--hgq-gamma/--hgq-beta. Pass this flag to fall back to the old uniform per-tensor QAT behavior.",
+    )
+    parser.add_argument(
+        "--hgq-gamma",
+        type=float,
+        default=0.0003,
+        help="L1 regularization coefficient pulling HGQ's per-element (i, f) bit-widths down directly "
+        "(HGQQuantizer.regularization_loss). Library default: 0.0003.",
+    )
+    parser.add_argument(
+        "--hgq-beta",
+        type=float,
+        default=1e-5,
+        help="Coefficient on the EBOPs (effective-bit-operations) resource loss, which pulls bit-widths down "
+        "in proportion to their actual hardware multiply cost rather than just their raw width. Library "
+        "default: 1e-5.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Override the yaml's seed.")
     parser.add_argument("--device", type=str, default=None, help="Override the yaml's device.")
     parser.add_argument("--note", type=str, default=None, help="Override the yaml's log-dir note.")
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=None,
+        help="Override model_kwargs.num_heads (must match the architecture of any --resume checkpoint, "
+        "e.g. a checkpoint trained via train_simple_hept.py --num-heads 1).",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Name of a log dir under <data_dir>/<dataset>/logs/ whose best_model.pt to resume from "
+        "(matches tracking_trainer_qat.run_one_seed_qat's existing config['resume'] convention -- NOT a "
+        "full path). Strongly recommended for HGQ: fine-tuning from an already-converged float checkpoint "
+        "is far more stable than applying HGQ pressure from scratch (see HEPTv2's harness recipes, which "
+        "always resume rather than training under HGQ from random init).",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Override the yaml's optimizer_kwargs.lr (default from the yaml: 1e-3, tuned for training "
+        "from scratch). When fine-tuning from --resume, a much smaller LR (e.g. 1e-4, matching HEPTv2's "
+        "HGQ fine-tune recipes) avoids immediately destabilizing the converged checkpoint.",
+    )
     args = parser.parse_args()
 
     config_path = REPO_ROOT / "HEPT" / "src" / "configs" / "tracking" / f"tracking_trans_{args.model}.yaml"
@@ -143,15 +197,24 @@ def main():
 
     config["data_dir"] = str(REPO_ROOT / "data")
     config["num_epochs"] = args.epochs
+    if args.resume is not None:
+        config["resume"] = args.resume
     if args.seed is not None:
         config["seed"] = args.seed
     if args.device is not None:
         config["device"] = args.device
+    if args.lr is not None:
+        config["optimizer_kwargs"]["lr"] = args.lr
+    if args.num_heads is not None:
+        config["model_kwargs"]["num_heads"] = args.num_heads
     config["note"] = args.note if args.note is not None else f"{config['note']}_qat{args.total_bits}_{args.integer_bits}"
 
     config["qat"] = {
         "total_bits": args.total_bits,
         "integer_bits": args.integer_bits,
+        "use_hgq": not args.disable_hgq,
+        "hgq_gamma": args.hgq_gamma,
+        "hgq_beta": args.hgq_beta,
         "enable_pruning": args.enable_pruning,
         "sparsity": args.sparsity,
         "pretraining_epochs": args.pretraining_epochs,

@@ -258,7 +258,7 @@ void compute_qkv_pre_qk_merged(
     typename CONFIG_T::weight_t               weight_q[CONFIG_T::dim_per_head * CONFIG_T::dim_per_head * CONFIG_T::num_head],
     typename CONFIG_T::weight_t               weight_k[CONFIG_T::dim_per_head * CONFIG_T::dim_per_head * CONFIG_T::num_head],
     typename CONFIG_T::weight_t               weight_v[CONFIG_T::dim_per_head * CONFIG_T::dim_per_head * CONFIG_T::num_head],
-    typename CONFIG_T::weight_t               sqrt_w[ CONFIG_T::num_head * CONFIG_T::coords_dim])
+    typename CONFIG_T::sqrt_w_t               sqrt_w[ CONFIG_T::num_head * CONFIG_T::coords_dim])
 {
     //#pragma HLS ARRAY_RESHAPE variable=weight   cyclic factor=CONFIG_T::dim_per_head*CONFIG_T::num_head dim=1
 
@@ -283,7 +283,7 @@ void compute_qkv_pre_qk_merged(
             typename CONFIG_T::accum_t row_buffer_q[CONFIG_T::dim_per_head * CONFIG_T::num_head];
             typename CONFIG_T::accum_t row_buffer_k[CONFIG_T::dim_per_head * CONFIG_T::num_head];
             typename CONFIG_T::accum_t row_buffer_v[CONFIG_T::dim_per_head * CONFIG_T::num_head];
-            
+
             INIT_ROW_BUFFER_LOOP:
             for(int j = 0; j < CONFIG_T::dim_per_head * CONFIG_T::num_head; j++) {
                 #pragma HLS UNROLL
@@ -298,8 +298,10 @@ void compute_qkv_pre_qk_merged(
                 data_T_coords data_pack_coords;
                 data_pack_coords = coords[pf*CONFIG_T::coords_dim+j].read();
                 for(int x = 0; x < CONFIG_T::num_head; x++) {
-                    sqrt_w_r_coords[j][x] = sqrt_w[x+j*CONFIG_T::num_head] * data_pack_coords;
-                    // std::cout <<  j << " " << x <<" sqrt_w[x+j*CONFIG_T::num_head]: " << sqrt_w[x+j*CONFIG_T::num_head] << " data_pack_coords: "<< data_pack_coords << " sqrt_w_r_coords: " << sqrt_w_r_coords[j][x] << std::endl;
+                    // sqrt_w_data is exported from PyTorch with shape (num_heads,
+                    // coords_dim), C-order flat as head_idx*coords_dim + coord_idx (x is
+                    // the head index, j is the coord index in this loop).
+                    sqrt_w_r_coords[j][x] = sqrt_w[x*CONFIG_T::coords_dim+j] * data_pack_coords;
                 }
             }
             // 16
@@ -307,12 +309,17 @@ void compute_qkv_pre_qk_merged(
             for (int x = 0; x < CONFIG_T::dim_per_head; x++) {
                 data_T data_pack = data[pf*CONFIG_T::dim_per_head+x].read();
                 // 32
+                // PyTorch nn.Linear weight is (out_features, in_features), exported
+                // C-order flat as out_idx*in_features + in_idx (matches out_linear's
+                // indexing below). Here j is the output index (0..dim_per_head*num_head-1)
+                // and x is the input index (0..dim_per_head-1), so the correct stride is
+                // j*dim_per_head + x, not x*dim_per_head*num_head + j.
                 ROW_BUFFER_LOOP:
                 for(int j = 0; j < CONFIG_T::dim_per_head * CONFIG_T::num_head; j++) {
                     #pragma HLS UNROLL
-                    row_buffer_q[j] += data_pack * weight_q[x * CONFIG_T::dim_per_head * CONFIG_T::num_head + j];
-                    row_buffer_k[j] += data_pack * weight_k[x * CONFIG_T::dim_per_head * CONFIG_T::num_head + j];
-                    row_buffer_v[j] += data_pack * weight_v[x * CONFIG_T::dim_per_head * CONFIG_T::num_head + j];
+                    row_buffer_q[j] += data_pack * weight_q[j * CONFIG_T::dim_per_head + x];
+                    row_buffer_k[j] += data_pack * weight_k[j * CONFIG_T::dim_per_head + x];
+                    row_buffer_v[j] += data_pack * weight_v[j * CONFIG_T::dim_per_head + x];
                 }
             }
             // 32
@@ -322,6 +329,14 @@ void compute_qkv_pre_qk_merged(
                     res_T res_pack_q = row_buffer_q[j * CONFIG_T::dim_per_head + x];
                     res_T res_pack_k = row_buffer_k[j * CONFIG_T::dim_per_head + x];
                     res_T res_pack_v = row_buffer_v[j * CONFIG_T::dim_per_head + x];
+#ifdef HEPT_DEBUG_QKV_DUMP
+                    if (i == 0) {
+                        int global_seq = i * CONFIG_T::par_factor + pf;
+                        std::cout << "HEPT_DEBUG_QKV seq=" << global_seq << " head=" << j << " dim=" << x
+                                  << " q=" << (double)res_pack_q << " k=" << (double)res_pack_k
+                                  << " v=" << (double)res_pack_v << std::endl;
+                    }
+#endif
                     q[pf*(CONFIG_T::dim_per_head + CONFIG_T::coords_dim)*CONFIG_T::num_head+j * (CONFIG_T::dim_per_head + CONFIG_T::coords_dim) + x].write(res_pack_q);
                     k[pf*(CONFIG_T::dim_per_head + CONFIG_T::coords_dim)*CONFIG_T::num_head+j * (CONFIG_T::dim_per_head + CONFIG_T::coords_dim) + x].write(res_pack_k);
                     v[pf*CONFIG_T::dim_per_head*CONFIG_T::num_head+j * CONFIG_T::dim_per_head + x].write(res_pack_v);

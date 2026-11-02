@@ -42,7 +42,7 @@ void lsh_mapping_combined_shift(
     hls::stream<data_T_combined_shifts>     combined_shifts[CONFIG_T::par_factor_sort*CONFIG_T::num_head*CONFIG_T::num_hashes],
     hls::stream<res_T_qk>     q_hashed_combined[CONFIG_T::num_head*CONFIG_T::num_hashes][CONFIG_T::par_factor_sort],
     hls::stream<res_T_qk>     k_hashed_combined[CONFIG_T::num_head*CONFIG_T::num_hashes][CONFIG_T::par_factor_sort],
-    typename CONFIG_T::weight_t               weight[(CONFIG_T::dim_per_head+CONFIG_T::coords_dim)*CONFIG_T::num_head*CONFIG_T::num_hashes])
+    typename CONFIG_T::alpha_t               weight[(CONFIG_T::dim_per_head+CONFIG_T::coords_dim)*CONFIG_T::num_head*CONFIG_T::num_hashes])
 {
     #pragma HLS INLINE
     #pragma HLS DATAFLOW
@@ -142,8 +142,8 @@ void lsh_mapping_combined_shift(
                 if(i == 0) {
                     for(int k = 0; k < CONFIG_T::num_hashes; k++) {
                         #pragma HLS UNROLL
-                        row_max[j][k][pf] = (row_buffer_q[j][k] > row_buffer_k[j][k]) ? row_buffer_q[j][k] : row_buffer_k[k+5*j];
-                        row_min[j][k][pf] = (row_buffer_q[j][k] < row_buffer_k[j][k]) ? row_buffer_q[j][k] : row_buffer_k[k+5*j];
+                        row_max[j][k][pf] = (row_buffer_q[j][k] > row_buffer_k[j][k]) ? row_buffer_q[j][k] : row_buffer_k[j][k];
+                        row_min[j][k][pf] = (row_buffer_q[j][k] < row_buffer_k[j][k]) ? row_buffer_q[j][k] : row_buffer_k[j][k];
                     }
                 }  else {
                     for(int k = 0; k < CONFIG_T::num_hashes; k++) {
@@ -190,12 +190,24 @@ void lsh_mapping_combined_shift(
         for (int i = 0; i < CONFIG_T::seq_len / CONFIG_T::par_factor_sort; i++) {
             #pragma HLS PIPELINE II=1 rewind
             for (int par = 0; par < CONFIG_T::par_factor_sort; par++) {
-                data_pack_combined_shifts = combined_shifts[n*CONFIG_T::par_factor_sort+par].read();
+                // packed_stream_to_scalar_lanes (nnet_hept.h) writes dst[pf*CHANNELS+c]
+                // (lane-major) -- match that here, not the channel-major n*par_factor_sort+par
+                // this used to read (which silently pulled a different (lane,channel) pair
+                // than intended for most n/par combinations).
+                data_pack_combined_shifts = combined_shifts[par*CONFIG_T::num_head*CONFIG_T::num_hashes+n].read();
                 int seq = i * CONFIG_T::par_factor_sort + par;
                 typename CONFIG_T::accum_t tmp_q = col_buffer_q[current_head][current_hash][seq] + hashed_shift*data_pack_combined_shifts;
                 typename CONFIG_T::accum_t tmp_k = col_buffer_k[current_head][current_hash][seq] + hashed_shift*data_pack_combined_shifts;
                 res_pack_q = tmp_q;
                 res_pack_k = tmp_k;
+#ifdef HEPT_DEBUG_HASH_DUMP
+                if (n == 0 && seq < 10) {
+                    std::cout << "HEPT_DEBUG_HASH seq=" << seq << " hashed_shift=" << (double)hashed_shift
+                              << " col_buffer_q=" << (double)col_buffer_q[current_head][current_hash][seq]
+                              << " combined_shift=" << (double)data_pack_combined_shifts
+                              << " tmp_q=" << (double)tmp_q << std::endl;
+                }
+#endif
                 q_hashed_combined[n][par].write(res_pack_q);
                 k_hashed_combined[n][par].write(res_pack_k);
             }
@@ -274,6 +286,12 @@ void bucket_sort_single(
 {
     #pragma HLS INLINE OFF
 
+#ifdef HEPT_DEBUG_SORT_DUMP
+    static int bucket_sort_call_count = 0;
+    bool debug_this_call = (bucket_sort_call_count == 0);
+    bucket_sort_call_count++;
+#endif
+
     // --------- Storage ----------
     // Keep input buffering as you had
     res_T data_buf[CONFIG_T::seq_len / CONFIG_T::par_factor_sort][CONFIG_T::par_factor_sort];
@@ -282,15 +300,16 @@ void bucket_sort_single(
     res_T hist_lane[CONFIG_T::par_factor_sort][32];
     #pragma HLS ARRAY_PARTITION variable=hist_lane complete dim=1
 
-    // Pass 2: totals/base/lane offsets
+    // Pass 2: totals/base (bucket-major ordering -- unaffected by the tie-break bug below)
     res_T total[32];
     res_T base[32];
-    res_T lane_off[CONFIG_T::par_factor_sort][32];
-    #pragma HLS ARRAY_PARTITION variable=lane_off complete dim=1
 
-    // Pass 3: per-lane cursors (no conflicts)
-    res_T lane_cur[CONFIG_T::par_factor_sort][32];
-    #pragma HLS ARRAY_PARTITION variable=lane_cur complete dim=1
+    // Running GLOBAL (not per-lane) per-bucket sequential counter, used in Pass 3 to break
+    // ties between same-bucket tokens by true original sequential position (p = i*par_factor_sort+par)
+    // instead of by which parallel lane processed them -- matches the PyTorch reference's
+    // `argsort(dim=-1, stable=True)` semantics the model is trained against (hept.py).
+    res_T seq_cur[32];
+    #pragma HLS ARRAY_PARTITION variable=seq_cur complete dim=1
 
     // --------- Init ---------
     // Zero histograms
@@ -303,15 +322,10 @@ void bucket_sort_single(
         }
     }
 
-    
-    // Zero lane cursors
-    BUCKET_SORT_INIT_CUR:
-    for (int p = 0; p < CONFIG_T::par_factor_sort; p++) {
+    BUCKET_SORT_INIT_SEQ_CUR:
+    for (int b = 0; b < 32; b++) {
         #pragma HLS UNROLL
-        for (int b = 0; b < 32; b++) {
-            #pragma HLS UNROLL
-            lane_cur[p][b] = 0;
-        }
+        seq_cur[b] = 0;
     }
 
     // --------- Pass 1: read & build per-lane histograms ---------
@@ -328,6 +342,13 @@ void bucket_sort_single(
 
             res_T k = (res_T)raw;
             data_buf[i][par] = k;
+
+#ifdef HEPT_DEBUG_SORT_DUMP
+            if (debug_this_call) {
+                int global_seq = i * CONFIG_T::par_factor_sort + par;
+                std::cout << "HEPT_DEBUG_SORT_KEY seq=" << global_seq << " key=" << (int)k << std::endl;
+            }
+#endif
 
             // Lane-private histogram update -> no cross-lane conflict
             hist_lane[par][k] = hist_lane[par][k] + (res_T)1;
@@ -356,33 +377,61 @@ void bucket_sort_single(
         run = run + total[b];
     }
 
-    // lane_off[par][b] = sum_{q < par} hist_lane[q][b]
-    BUCKET_SORT_LANE_OFF:
-    for (int b = 0; b < 32; b++) {
-        #pragma HLS UNROLL
-        res_T s = 0;
-        for (int p = 0; p < CONFIG_T::par_factor_sort; p++) {
-            #pragma HLS UNROLL
-            lane_off[p][b] = s;
-            s = s + hist_lane[p][b];
-        }
-    }
-
-    // --------- Pass 3: emit ranks with lane-local cursors ---------
-
+    // --------- Pass 3: emit ranks in true global sequential tie-break order ---------
+    // For a token at global position p=i*par_factor_sort+par in bucket k, its correct
+    // rank is base[k] + (count of bucket-k tokens at global position < p). Since par
+    // ascends with p within a fixed i, that count splits into:
+    //   seq_cur[k]            -- bucket-k tokens from all PRIOR i (true global prefix)
+    //   within_cycle_prefix   -- bucket-k tokens at THIS i with a smaller par (par' < par,
+    //                            which is also smaller global position since i is fixed)
+    // seq_cur is then bulk-advanced by this cycle's per-bucket hit counts for the next i.
     WRITE_SORTED_INDEX_INNER:
     for (int i = 0; i < CONFIG_T::seq_len / CONFIG_T::par_factor_sort; i++) {
         #pragma HLS PIPELINE II=1 rewind
+
+        res_T k_this[CONFIG_T::par_factor_sort];
+        #pragma HLS ARRAY_PARTITION variable=k_this complete dim=1
         for (int par = 0; par < CONFIG_T::par_factor_sort; par++) {
             #pragma HLS UNROLL
-            res_T k = data_buf[i][par];
+            k_this[par] = data_buf[i][par];
+        }
 
-            // rank = base[k] + lane_off[par][k] + lane_cur[par][k]
-            res_T res_pack = base[k] + lane_off[par][k] + lane_cur[par][k];
+        res_T within_cycle_prefix[CONFIG_T::par_factor_sort];
+        #pragma HLS ARRAY_PARTITION variable=within_cycle_prefix complete dim=1
+        for (int par = 0; par < CONFIG_T::par_factor_sort; par++) {
+            #pragma HLS UNROLL
+            res_T cnt = 0;
+            for (int q = 0; q < par; q++) {
+                #pragma HLS UNROLL
+                if (k_this[q] == k_this[par]) cnt = cnt + (res_T)1;
+            }
+            within_cycle_prefix[par] = cnt;
+        }
+
+        for (int par = 0; par < CONFIG_T::par_factor_sort; par++) {
+            #pragma HLS UNROLL
+            res_T k = k_this[par];
+            res_T res_pack = base[k] + seq_cur[k] + within_cycle_prefix[par];
             index[par].write(res_pack);
+#ifdef HEPT_DEBUG_SORT_DUMP
+            if (debug_this_call) {
+                int global_seq = i * CONFIG_T::par_factor_sort + par;
+                std::cout << "HEPT_DEBUG_SORT_RANK seq=" << global_seq << " rank=" << (int)res_pack << std::endl;
+            }
+#endif
+        }
 
-            // lane-private increment -> no hazard
-            lane_cur[par][k] = lane_cur[par][k] + (res_T)1;
+        // Bulk-advance the global per-bucket counter by this cycle's hit counts, so the
+        // snapshot the NEXT i's lanes read already reflects every token up through i.
+        BUCKET_SORT_SEQ_CUR_ADVANCE:
+        for (int b = 0; b < 32; b++) {
+            #pragma HLS UNROLL
+            res_T inc = 0;
+            for (int par = 0; par < CONFIG_T::par_factor_sort; par++) {
+                #pragma HLS UNROLL
+                if (k_this[par] == (res_T)b) inc = inc + (res_T)1;
+            }
+            seq_cur[b] = seq_cur[b] + inc;
         }
     }
 }
@@ -869,13 +918,27 @@ void batched_index_select(
     // Store only [seq][head] (hash-independent)
     typedef typename CONFIG_T::qk_tile_wide_t wide_t;
 
-    wide_t data_buf[CONFIG_T::seq_len][CONFIG_T::num_tiles];   // num_tiles == num_head
+    // Stage 2 below unrolls (hash, head, par) together and issues one random-access read
+    // per combination per cycle -- head is already a separate bank via the reshape below,
+    // but (hash, par) are not, so num_hashes*par_factor_sort independently-indexed reads
+    // can land on the same bank in the same cycle. The previous version resolved this by
+    // completely partitioning the seq_len dimension (ARRAY_PARTITION complete dim=1),
+    // which gives every reader a private element -- but on a fully depth-1 "array" there
+    // is nothing left for BIND_STORAGE to map onto, so despite the impl=bram directive
+    // this fell back to plain registers (measured: ~925K FF per instance, 0 BRAM).
+    //
+    // The buffer content is hash-independent (same Q/K data for every hash), so instead of
+    // replicating per (hash, par) -- which tripled BRAM for no reason, since hash was only
+    // unrolled for a throughput reason -- Stage 2 below now keeps hash as a sequential
+    // (pipelined) loop and only unrolls (head, par). That needs just `par_factor_sort`
+    // replicas; each replica keeps its full seq_len depth, so BIND_STORAGE places it in BRAM.
+    wide_t data_buf[CONFIG_T::par_factor_sort][CONFIG_T::seq_len][CONFIG_T::num_tiles];
     #pragma HLS ARRAY_PARTITION variable=data_buf complete dim=1
-    #pragma HLS ARRAY_RESHAPE variable=data_buf complete dim=2
+    #pragma HLS ARRAY_RESHAPE variable=data_buf complete dim=3
     #pragma HLS BIND_STORAGE  variable=data_buf type=ram_1p impl=bram
     // Consider impl=uram if capacity/timing requires.
 
-    // -------- Stage 1: Read all values -> BRAM --------
+    // -------- Stage 1: Read all values -> BRAM (broadcast to every par replica) --------
     BATCHED_INDEX_SELECT_READ_VALUE_LOOP:
     for (int seq = 0; seq < CONFIG_T::seq_len / CONFIG_T::par_factor; seq++) {
         #pragma HLS PIPELINE II=1 rewind
@@ -901,34 +964,44 @@ void batched_index_select(
 
                     data_buf_row.range(hi, lo) = bits;
                 }
-                // Write once per (seq, head) — no redundant hash writes
-                data_buf[global_seq][head] = data_buf_row;
+                // Write once per (seq, head), broadcast to every par replica.
+                for (int rep = 0; rep < CONFIG_T::par_factor_sort; rep++) {
+                    #pragma HLS UNROLL
+                    data_buf[rep][global_seq][head] = data_buf_row;
+                }
             }
         }
     }
 
     // -------- Stage 2: Index select -> stream out --------
+    // `hash` is sequential (pipelined), not unrolled: the buffer is hash-independent, so
+    // unrolling it would only force more replicas without adding real parallelism. `i`
+    // (= hash*num_head + head) still advances in the exact same order as before, so each
+    // indices[i][par]/res_data[i][*] stream channel is read/written the same number of
+    // times, in the same order -- only the hardware schedule changes, not the result.
     BATCHED_INDEX_SELECT_WRITE_RES_INNER:
     for (int seq = 0; seq < CONFIG_T::seq_len / CONFIG_T::par_factor_sort; seq++) {
-        #pragma HLS PIPELINE II=1 rewind
-        for (int i = 0; i < CONFIG_T::num_hashes*CONFIG_T::num_head; i++) {
-            #pragma HLS UNROLL
-            const int current_head = i % CONFIG_T::num_head;
-            for (int par = 0; par < CONFIG_T::par_factor_sort; par++) {
+        for (int hash = 0; hash < CONFIG_T::num_hashes; hash++) {
+            #pragma HLS PIPELINE II=1 rewind
+            for (int head = 0; head < CONFIG_T::num_head; head++) {
                 #pragma HLS UNROLL
-                data_T_indices data_pack_indices = indices[i][par].read();
-                wide_t data_buf_row = data_buf[(int)data_pack_indices][current_head];
+                const int i = hash * CONFIG_T::num_head + head;
+                for (int par = 0; par < CONFIG_T::par_factor_sort; par++) {
+                    #pragma HLS UNROLL
+                    data_T_indices data_pack_indices = indices[i][par].read();
+                    wide_t data_buf_row = data_buf[par][(int)data_pack_indices][head];
 
-                // --- reverted to reinterpret_cast unpacking ---
-                WRITE_ROW_TO_STREAM:
-                for (int y = 0; y < (CONFIG_T::dim_per_head+CONFIG_T::coords_dim); y++) {
-                    const int lo = y * CONFIG_T::elem_bits;
-                    const int hi = lo + CONFIG_T::elem_bits - 1;
+                    // --- reverted to reinterpret_cast unpacking ---
+                    WRITE_ROW_TO_STREAM:
+                    for (int y = 0; y < (CONFIG_T::dim_per_head+CONFIG_T::coords_dim); y++) {
+                        const int lo = y * CONFIG_T::elem_bits;
+                        const int hi = lo + CONFIG_T::elem_bits - 1;
 
-                    typename CONFIG_T::elem_bits_t bits = data_buf_row.range(hi, lo);
-                    res_T res_pack = *reinterpret_cast<res_T*>(&bits);
+                        typename CONFIG_T::elem_bits_t bits = data_buf_row.range(hi, lo);
+                        res_T res_pack = *reinterpret_cast<res_T*>(&bits);
 
-                    res_data[i][par*(CONFIG_T::dim_per_head+CONFIG_T::coords_dim) + y].write(res_pack);
+                        res_data[i][par*(CONFIG_T::dim_per_head+CONFIG_T::coords_dim) + y].write(res_pack);
+                    }
                 }
             }
         }
@@ -949,13 +1022,19 @@ void batched_index_select_2(
     // Store only [seq][head] (hash-independent)
     typedef typename CONFIG_T::v_tile_wide_t wide_t;
 
-    wide_t data_buf[CONFIG_T::seq_len][CONFIG_T::num_tiles]; // num_tiles == num_head
+    // See batched_index_select() above: the buffer is hash-independent, so instead of
+    // replicating per (hash, par) -- which tripled BRAM for no reason -- Stage 2 below
+    // keeps hash as a sequential (pipelined) loop and only unrolls (head, par), needing
+    // just `par_factor_sort` replicas, each keeping its full seq_len depth so
+    // BIND_STORAGE can actually place it in BRAM (a fully-partitioned, depth-1 array has
+    // nothing left to bind).
+    wide_t data_buf[CONFIG_T::par_factor_sort][CONFIG_T::seq_len][CONFIG_T::num_tiles]; // num_tiles == num_head
     #pragma HLS ARRAY_PARTITION variable=data_buf complete dim=1
-    #pragma HLS ARRAY_RESHAPE variable=data_buf complete dim=2
+    #pragma HLS ARRAY_RESHAPE variable=data_buf complete dim=3
     #pragma HLS BIND_STORAGE  variable=data_buf type=ram_1p impl=bram
     // Switch to impl=uram if capacity/timing requires.
 
-    // -------- Stage 1: Read all values -> BRAM --------
+    // -------- Stage 1: Read all values -> BRAM (broadcast to every par replica) --------
     BATCHED_INDEX_SELECT_2_READ_VALUE_LOOP:
     for (int seq = 0; seq < CONFIG_T::seq_len / CONFIG_T::par_factor; seq++) {
         #pragma HLS PIPELINE II=1 rewind
@@ -981,37 +1060,43 @@ void batched_index_select_2(
                     data_buf_row.range(hi, lo) = bits;
                 }
 
-                // Write once per (seq, head) — no redundant hash writes
-                data_buf[global_seq][head] = data_buf_row;
+                // Write once per (seq, head), broadcast to every par replica.
+                for (int rep = 0; rep < CONFIG_T::par_factor_sort; rep++) {
+                    #pragma HLS UNROLL
+                    data_buf[rep][global_seq][head] = data_buf_row;
+                }
             }
         }
     }
 
     // -------- Stage 2: Index select -> stream out --------
-    //BATCHED_INDEX_SELECT_2_WRITE_RES_OUTER:
-        // const int current_hash = i / CONFIG_T::num_head; // kept if needed for bookkeeping
-
+    // `hash` is sequential (pipelined), not unrolled -- see batched_index_select() above.
+    // `i` (= hash*num_head + head) still advances in the same order as before, so each
+    // indices[i][par]/res_data[i][*] stream channel is read/written the same number of
+    // times, in the same order.
     BATCHED_INDEX_SELECT_2_WRITE_RES_INNER:
     for (int seq = 0; seq < CONFIG_T::seq_len / CONFIG_T::par_factor_sort; seq++) {
-        #pragma HLS PIPELINE II=1 rewind
-        for (int i = 0; i < CONFIG_T::num_hashes * CONFIG_T::num_head; i++) {
-            #pragma HLS UNROLL
-            const int current_head = i % CONFIG_T::num_head;
-            for (int par = 0; par < CONFIG_T::par_factor_sort; par++) {
+        for (int hash = 0; hash < CONFIG_T::num_hashes; hash++) {
+            #pragma HLS PIPELINE II=1 rewind
+            for (int head = 0; head < CONFIG_T::num_head; head++) {
                 #pragma HLS UNROLL
+                const int i = hash * CONFIG_T::num_head + head;
+                for (int par = 0; par < CONFIG_T::par_factor_sort; par++) {
+                    #pragma HLS UNROLL
 
-                data_T_indices idx = indices[i][par].read();
-                wide_t data_buf_row = data_buf[(int)idx][current_head];
+                    data_T_indices idx = indices[i][par].read();
+                    wide_t data_buf_row = data_buf[par][(int)idx][head];
 
-                // Directly read row from BRAM and stream out
-                WRITE_ROW_TO_STREAM:
-                for (int y = 0; y < CONFIG_T::dim_per_head; y++) {
-                    const int lo = y * CONFIG_T::elem_bits;
-                    const int hi = lo + CONFIG_T::elem_bits - 1;
+                    // Directly read row from BRAM and stream out
+                    WRITE_ROW_TO_STREAM:
+                    for (int y = 0; y < CONFIG_T::dim_per_head; y++) {
+                        const int lo = y * CONFIG_T::elem_bits;
+                        const int hi = lo + CONFIG_T::elem_bits - 1;
 
-                    typename CONFIG_T::elem_bits_t bits = data_buf_row.range(hi, lo);
-                    res_T res_pack = *reinterpret_cast<res_T*>(&bits);
-                    res_data[i][par * CONFIG_T::dim_per_head + y].write(res_pack);
+                        typename CONFIG_T::elem_bits_t bits = data_buf_row.range(hi, lo);
+                        res_T res_pack = *reinterpret_cast<res_T*>(&bits);
+                        res_data[i][par * CONFIG_T::dim_per_head + y].write(res_pack);
+                    }
                 }
             }
         }
@@ -1142,6 +1227,11 @@ void qkv_res(
                     }
                     // std::cout << "res_denom_temp: " << res_denom_temp << std::endl;
                     denom[i][p*CONFIG_T::block_size+j].write((res_T_denom)res_denom_temp);
+#ifdef HEPT_DEBUG_QKVRES_DUMP
+                    if (i == 0 && f == 0 && p == 0) {
+                        std::cout << "HEPT_DEBUG_QKVRES_DENOM j=" << j << " denom=" << (double)res_denom_temp << std::endl;
+                    }
+#endif
                 }
                 INIT_SO_ROW_BUF:
                 for(int j = 0; j < CONFIG_T::block_size*CONFIG_T::dim_per_head; j++) {
@@ -1163,6 +1253,12 @@ void qkv_res(
                     for(int k = 0; k < CONFIG_T::dim_per_head; k++) {
                         #pragma HLS UNROLL
                         so[i][(p*CONFIG_T::block_size+j)*CONFIG_T::dim_per_head+k].write((res_T_so)so_row_buffer[j*CONFIG_T::dim_per_head+k]);
+#ifdef HEPT_DEBUG_QKVRES_DUMP
+                        if (i == 0 && f == 0 && p == 0) {
+                            std::cout << "HEPT_DEBUG_QKVRES_SO j=" << j << " k=" << k
+                                      << " so=" << (double)so_row_buffer[j*CONFIG_T::dim_per_head+k] << std::endl;
+                        }
+#endif
                     }
                 }
             }
@@ -1212,12 +1308,26 @@ void invert_permutation(
 
 template<class data_T_indices, class data_T_values, class res_T, typename CONFIG_T>
 void batched_index_select_unsort_o_num_hash(
-    hls::stream<data_T_indices> indices[CONFIG_T::num_hashes][CONFIG_T::par_factor_sort],
-    hls::stream<data_T_values>  values[CONFIG_T::num_hashes][CONFIG_T::par_factor_sort * CONFIG_T::dim_per_head],
-    hls::stream<res_T> res_data[CONFIG_T::dim_per_head * CONFIG_T::par_factor])
+    // Full hash-major [num_hashes*num_head] arrays (index = hash*num_head+head, the
+    // convention established by lsh_mapping_combined_shift and used everywhere else in
+    // this kernel) plus the target head -- NOT a pre-sliced [num_hashes]-only array. A
+    // fixed head's num_hashes elements are strided by num_head in this layout, so they
+    // cannot be extracted via a contiguous pointer offset (&indices[head*num_hashes] is
+    // only valid under a head-major layout, which this is not); index with the stride
+    // explicitly instead.
+    hls::stream<data_T_indices> indices[CONFIG_T::num_hashes * CONFIG_T::num_head][CONFIG_T::par_factor_sort],
+    hls::stream<data_T_values>  values[CONFIG_T::num_hashes * CONFIG_T::num_head][CONFIG_T::par_factor_sort * CONFIG_T::dim_per_head],
+    hls::stream<res_T> res_data[CONFIG_T::dim_per_head * CONFIG_T::par_factor],
+    int head)
 {
     #pragma HLS INLINE OFF
     #pragma HLS DATAFLOW
+
+#ifdef HEPT_DEBUG_UNSORT_DUMP
+    static int unsort_o_call_count = 0;
+    bool debug_this_unsort_call = (unsort_o_call_count == 0);
+    unsort_o_call_count++;
+#endif
 
     // Local buffers in BRAM
 
@@ -1226,7 +1336,18 @@ void batched_index_select_unsort_o_num_hash(
     #pragma HLS ARRAY_PARTITION variable=data_buffer complete dim=3
 
 
-    typename CONFIG_T::unsort_o_tile_wide_t data_buffer_row[CONFIG_T::num_hashes][CONFIG_T::seq_len];
+    // data_buffer_row needs CONFIG_T::par_factor_sort concurrent, independently-indexed
+    // random-access reads per cycle (one per parallel lane, each with a runtime-arbitrary
+    // index) -- a single BRAM can't provide that many ports. The previous version solved
+    // this by fully partitioning the seq_len dimension (ARRAY_PARTITION complete), which
+    // gives every lane its own conflict-free port, but at the cost of exploding this into
+    // CONFIG_T::seq_len separate single-element "BRAMs" (measured: ~195% of the whole
+    // part's BRAM budget from this one buffer). Instead, replicate the *whole* buffer
+    // par_factor_sort times (broadcasting the same write to every copy) and let each lane
+    // read exclusively from its own copy -- same conflict-free parallelism, but each copy
+    // is a normal, properly-packed BRAM addressed over its full seq_len depth rather than
+    // seq_len separate single-entry memories.
+    typename CONFIG_T::unsort_o_tile_wide_t data_buffer_row[CONFIG_T::num_hashes][CONFIG_T::par_factor_sort][CONFIG_T::seq_len];
     #pragma HLS ARRAY_PARTITION variable=data_buffer_row complete dim=2
     #pragma HLS BIND_STORAGE variable=data_buffer_row  type=ram_1p impl=bram
     // Main computation
@@ -1234,15 +1355,20 @@ void batched_index_select_unsort_o_num_hash(
     for(int n = 0; n < CONFIG_T::num_hashes; n++) {
         for(int i = 0; i < CONFIG_T::seq_len / CONFIG_T::par_factor_sort; i++) {
         #pragma HLS PIPELINE II=1 rewind
-            // --- Stage 1: Read values into buffer ---
+            // --- Stage 1: Read values into buffer (broadcast to every replica) ---
             for(int par = 0; par < CONFIG_T::par_factor_sort; par++) {
                 int seq = i * CONFIG_T::par_factor_sort + par;
                 for(int l = 0; l < CONFIG_T::dim_per_head; l++) {
                     #pragma HLS UNROLL
                     int lo = l * CONFIG_T::unsort_o_elem_bits;
                     int hi = lo + CONFIG_T::unsort_o_elem_bits - 1;
-                    data_T_values data_pack_values = values[n][par*CONFIG_T::dim_per_head+l].read();
-                    data_buffer_row[n][seq].range(hi, lo) = *reinterpret_cast<typename CONFIG_T::unsort_o_elem_bits_t*>(&data_pack_values);
+                    data_T_values data_pack_values = values[n*CONFIG_T::num_head+head][par*CONFIG_T::dim_per_head+l].read();
+                    typename CONFIG_T::unsort_o_elem_bits_t bits =
+                        *reinterpret_cast<typename CONFIG_T::unsort_o_elem_bits_t*>(&data_pack_values);
+                    for (int rep = 0; rep < CONFIG_T::par_factor_sort; rep++) {
+                        #pragma HLS UNROLL
+                        data_buffer_row[n][rep][seq].range(hi, lo) = bits;
+                    }
                 }
             }
         }
@@ -1251,10 +1377,11 @@ void batched_index_select_unsort_o_num_hash(
     for(int n = 0; n < CONFIG_T::num_hashes; n++) {
         for(int i = 0; i < CONFIG_T::seq_len / CONFIG_T::par_factor_sort; i++) {
         #pragma HLS PIPELINE II=1 rewind
-        // --- Stage 1: Read values into buffer ---
+        // --- Stage 1: Read values into buffer (lane `par` reads only its own replica) ---
             for(int par = 0; par < CONFIG_T::par_factor_sort; par++) {
-                data_T_indices data_pack_indices = indices[n][par].read();
-                data_buffer[n][i][par] = data_buffer_row[n][data_pack_indices];
+                #pragma HLS UNROLL
+                data_T_indices data_pack_indices = indices[n*CONFIG_T::num_head+head][par].read();
+                data_buffer[n][i][par] = data_buffer_row[n][par][data_pack_indices];
             }
         }
     }
@@ -1279,6 +1406,11 @@ void batched_index_select_unsort_o_num_hash(
                     } else if (n == CONFIG_T::num_hashes - 1) {
                         res_T res_pack = (res_T)(data_accum[i][par][l] + data_value);
                         res_data[l * CONFIG_T::par_factor + par].write(res_pack);
+#ifdef HEPT_DEBUG_UNSORT_DUMP
+                        if (debug_this_unsort_call && i == 0 && par == 0) {
+                            std::cout << "HEPT_DEBUG_UNSORT_O l=" << l << " o=" << (double)res_pack << std::endl;
+                        }
+#endif
                     } else {
                         data_accum[i][par][l] += data_value;
                     }
@@ -1454,9 +1586,12 @@ void batched_index_select_unsort_o(
 
 template<class data_T_indices, class data_T_values, class res_T, typename CONFIG_T>
 void batched_index_select_unsort_logits_num_hash(
-    hls::stream<data_T_indices> indices[CONFIG_T::num_hashes][CONFIG_T::par_factor_sort],
-    hls::stream<data_T_values>  values[CONFIG_T::num_hashes][CONFIG_T::par_factor_sort],
-    hls::stream<res_T> res_data[ CONFIG_T::par_factor])
+    // See batched_index_select_unsort_o_num_hash's comment: full hash-major
+    // [num_hashes*num_head] arrays plus the target head, not a pre-sliced array.
+    hls::stream<data_T_indices> indices[CONFIG_T::num_hashes * CONFIG_T::num_head][CONFIG_T::par_factor_sort],
+    hls::stream<data_T_values>  values[CONFIG_T::num_hashes * CONFIG_T::num_head][CONFIG_T::par_factor_sort],
+    hls::stream<res_T> res_data[ CONFIG_T::par_factor],
+    int head)
 {
     #pragma HLS INLINE OFF
     #pragma HLS DATAFLOW
@@ -1480,7 +1615,7 @@ void batched_index_select_unsort_logits_num_hash(
             for(int par = 0; par < CONFIG_T::par_factor_sort; par++) {
                 #pragma HLS UNROLL
                 int seq = i * CONFIG_T::par_factor_sort + par;
-                data_T_values data_pack_values = values[n][par].read();
+                data_T_values data_pack_values = values[n*CONFIG_T::num_head+head][par].read();
                 data_buffer_row[n][seq] = data_pack_values;
             }
         }
@@ -1491,7 +1626,7 @@ void batched_index_select_unsort_logits_num_hash(
         #pragma HLS PIPELINE II=1 rewind
         // --- Stage 1: Read values into buffer ---
             for(int par = 0; par < CONFIG_T::par_factor_sort; par++) {
-                data_T_indices data_pack_indices = indices[n][par].read();
+                data_T_indices data_pack_indices = indices[n*CONFIG_T::num_head+head][par].read();
                 data_buffer[n][i][par] = data_buffer_row[n][data_pack_indices];
             }
         }
@@ -1628,20 +1763,25 @@ void o_divide_logits(
     data_T_logits data_pack_logits;
     res_T res_pack;
 
+    // o/logits are written by UNSORT_HEAD (nnet_hept.h) as head-major: o_offset =
+    // h*dim_per_head*par_factor with inner index l*par_factor+par, and logits_offset =
+    // h*par_factor with inner index par -- i.e. global index h*dim_per_head*par_factor +
+    // k*par_factor + par (o) / h*par_factor + par (logits). Read with that same stride,
+    // not the par-major one this used to assume.
     O_DIVIDE_LOGITS:
     for(int seq = 0; seq < CONFIG_T::seq_len / CONFIG_T::par_factor; seq++) {
         #pragma HLS PIPELINE II=1 rewind
         for(int par = 0; par < CONFIG_T::par_factor; par++) {
             #pragma HLS UNROLL
             for(int h = 0; h < CONFIG_T::num_head; h++) {
-                data_pack_logits = logits[par*CONFIG_T::num_head+h].read();
+                data_pack_logits = logits[h*CONFIG_T::par_factor+par].read();
                 if(data_pack_logits==0) //{
                     data_pack_logits = 0.1;
                     //std::cout << "Warning: logits is zero, set to 0.001 to avoid NaN" << std::endl;
                     //std::cout << data_pack_logits << std::endl;
                 //}
                 for(int k = 0; k < CONFIG_T::dim_per_head; k++) {
-                    data_pack_o = o[par*CONFIG_T::num_head*CONFIG_T::dim_per_head+h*CONFIG_T::dim_per_head+k].read();
+                    data_pack_o = o[h*CONFIG_T::dim_per_head*CONFIG_T::par_factor+k*CONFIG_T::par_factor+par].read();
                     res_pack = (res_T)(data_pack_o / data_pack_logits);
                     res_data[par*CONFIG_T::num_head*CONFIG_T::dim_per_head+h*CONFIG_T::dim_per_head+k].write(res_pack);
                 }
@@ -1654,8 +1794,8 @@ template<class data_T, class res_T, typename CONFIG_T>
 void out_linear(
     hls::stream<data_T>     data[CONFIG_T::num_head*CONFIG_T::dim_per_head*CONFIG_T::par_factor],
     hls::stream<res_T>     res_data[CONFIG_T::dim_per_head*CONFIG_T::par_factor],
-    typename CONFIG_T::weight_t               weight[CONFIG_T::num_head*CONFIG_T::dim_per_head*CONFIG_T::dim_per_head],
-    typename CONFIG_T::weight_t                 bias[CONFIG_T::dim_per_head])
+    typename CONFIG_T::out_linear_weight_t               weight[CONFIG_T::num_head*CONFIG_T::dim_per_head*CONFIG_T::dim_per_head],
+    typename CONFIG_T::out_linear_bias_t                 bias[CONFIG_T::dim_per_head])
 {
     #pragma HLS INLINE OFF
     #pragma HLS DATAFLOW
