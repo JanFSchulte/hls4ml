@@ -155,7 +155,14 @@ def report(reference, hls_out):
     print(f"  hls       : {np.array2string(hls_out[0, :6], precision=4, floatmode='fixed')}")
 
 
-def main():
+def build_arg_parser():
+    """Build (but do not parse) the CLI argument parser.
+
+    Split out from main() so other scripts -- see verify_simple_hept.py, which runs
+    the synthesis/place-and-route pipeline on top of the project this file builds --
+    can reuse the exact same architecture/precision flags instead of redefining them
+    and risking the two copies drifting apart.
+    """
     parser = argparse.ArgumentParser(description="Convert a single HEPT attention block to HLS and compare outputs.")
     parser.add_argument("-m", "--model", type=str, default="hept")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for reproducible inputs/weights.")
@@ -230,10 +237,27 @@ def main():
         default=None,
         help="Override model_kwargs.num_heads (must match the architecture of any --checkpoint).",
     )
-    args = parser.parse_args()
+    return parser
 
+
+def build_hls_project(args):
+    """Build the PyTorch reference model and the matching hls4ml project from `args`.
+
+    This is everything convertSimpleHEPT.py needs before it can either run its own
+    quick Python-side correctness check (see main() below) or hand the project off to
+    verify_simple_hept.py for C synthesis / co-simulation / place-and-route. It does
+    NOT compile or run anything HLS-side; call `hls_model.compile()` (done by main()
+    below) if you need the fast Python/C-simulation prediction path.
+
+    Returns (hls_model, reference, x, coords, combined_shifts):
+        hls_model        -- the hls4ml ModelGraph, already converted (not yet compiled)
+        reference        -- PyTorch reference output, shape (seq_len, embed_dim)
+        x, coords,
+        combined_shifts  -- the three C-simulation input arrays `hls_model.predict()`
+                            expects, in that order
+    """
     if args.real_data and not args.checkpoint:
-        parser.error("--real-data requires --checkpoint (a trained HEPT attention-block state dict)")
+        raise ValueError("--real-data requires --checkpoint (a trained HEPT attention-block state dict)")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -327,8 +351,15 @@ def main():
         backend=BACKEND,
         io_type=IO_TYPE,
     )
-    hls_model.compile()
 
+    return hls_model, reference, x, coords, combined_shifts
+
+
+def main():
+    args = build_arg_parser().parse_args()
+    hls_model, reference, x, coords, combined_shifts = build_hls_project(args)
+
+    hls_model.compile()
     # hls4ml returns the output flattened per sample; reshape to (seq_len, embed_dim).
     hls_prediction = np.asarray(hls_model.predict([x, coords, combined_shifts])).reshape(reference.shape)
 
